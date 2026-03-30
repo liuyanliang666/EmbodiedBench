@@ -40,7 +40,7 @@ DISCRETE_SKILLSET = [
 
 
 class EBNavigationEnv(gym.Env):
-    def __init__(self, eval_set='base', exp_name='test_base', down_sample_ratio=1.0, fov = 100, multiview = False, boundingbox = False, multistep = False,  resolution = 600, selected_indexes =[]):
+    def __init__(self, eval_set='base', exp_name='test_base', down_sample_ratio=1.0, fov = 100, multiview = False, boundingbox = False, multistep = False,  resolution = 600, selected_indexes =[], use_topdown_prompt=False):
         """
         A wrapper for AI2-THOR ManipulaTHOR environment.
 
@@ -98,6 +98,9 @@ class EBNavigationEnv(gym.Env):
         self.boundingbox = boundingbox
         self.multistep = multistep
         self.img_paths = []
+        self.use_topdown_prompt = bool(use_topdown_prompt)
+        self.topdown_builder = None
+        self.latest_topdown_rgb = None
 
     def _load_dataset(self, eval_set):
         with open(self.data_path) as f:
@@ -165,9 +168,8 @@ class EBNavigationEnv(gym.Env):
         self._current_step = 0
 
         self.standing = True
-        obs = {
-            'head_rgb': self.env.last_event.frame
-        }
+        self._reset_topdown_builder()
+        obs = self._get_observation()
         self._reset = True
         self.episode_log = []
         self._episode_start_time = time.time()
@@ -305,9 +307,7 @@ class EBNavigationEnv(gym.Env):
                 f"Unsupported action type: {type(action).__name__}",
             )
 
-        obs = {
-                    'head_rgb': self.env.last_event.frame,
-                }
+        obs = self._get_observation()
         reward, distance = self.measure_success()
         done = bool(reward > 0 or self._current_step >= self._max_episode_steps)
 
@@ -372,6 +372,50 @@ class EBNavigationEnv(gym.Env):
     def seed(self, seed=None):
         self.env.random_initilize(seed)
 
+    def _build_topdown_builder(self, reachable_positions=None):
+        from embodiedbench.envs.eb_alfred.topdown_mapping import AlfredTopdownBuilder, AlfredTopdownConfig, RenderBounds
+
+        initial_bounds = None
+        if reachable_positions:
+            padding = 1.5
+            thor_x_vals = [p["x"] for p in reachable_positions]
+            thor_z_vals = [p["z"] for p in reachable_positions]
+            # topdown coordinate: x = THOR z, y = -THOR x
+            initial_bounds = RenderBounds(
+                min_x=min(thor_z_vals) - padding,
+                max_x=max(thor_z_vals) + padding,
+                min_y=-max(thor_x_vals) - padding,
+                max_y=-min(thor_x_vals) + padding,
+            )
+
+        return AlfredTopdownBuilder(
+            AlfredTopdownConfig(
+                output_size=(self.resolution, self.resolution),
+                fov=self.config["fieldOfView"],
+                min_height=0.03,
+                max_height=1.5,
+            ),
+            initial_bounds=initial_bounds,
+        )
+
+    def _reset_topdown_builder(self):
+        if self.use_topdown_prompt:
+            event = self.env.step(action="GetReachablePositions")
+            reachable = event.metadata["actionReturn"]
+            self.topdown_builder = self._build_topdown_builder(reachable)
+        else:
+            self.topdown_builder = None
+        self.latest_topdown_rgb = None
+
+    def _get_observation(self):
+        obs = {
+            'head_rgb': self.env.last_event.frame,
+        }
+        if self.topdown_builder is not None:
+            self.latest_topdown_rgb = self.topdown_builder.add_event(self.env.last_event)
+            obs['topdown_rgb'] = self.latest_topdown_rgb
+        return obs
+
 
     def save_image(self, *args, **kwargs):
         """Save current agent view as a PNG image."""
@@ -397,6 +441,12 @@ class EBNavigationEnv(gym.Env):
             # image_path = 'episode_{}_step_{}_{}.png'.format(self._current_episode_num, self._current_step, time_stamp)
             image_path = os.path.join(self.log_path, 'episode_{}_step_{}_{}_front.png'.format(episode_idx, self._current_step, time_stamp))
             img.save(image_path)
+            if self.latest_topdown_rgb is not None:
+                topdown_path = os.path.join(
+                    self.log_path,
+                    'episode_{}_step_{}_{}_topdown.png'.format(episode_idx, self._current_step, time_stamp)
+                )
+                Image.fromarray(self.latest_topdown_rgb).save(topdown_path)
             self.img_paths.append(image_path)
             if self._current_step<3:
                 return self.img_paths
@@ -410,6 +460,12 @@ class EBNavigationEnv(gym.Env):
                 # image_path = 'episode_{}_step_{}_{}.png'.format(self._current_episode_num, self._current_step, time_stamp)
                 image_path = os.path.join(self.log_path, 'episode_{}_step_{}_{}_front.png'.format(episode_idx, self._current_step, time_stamp))
                 img.save(image_path)
+                if self.latest_topdown_rgb is not None:
+                    topdown_path = os.path.join(
+                        self.log_path,
+                        'episode_{}_step_{}_{}_topdown.png'.format(episode_idx, self._current_step, time_stamp)
+                    )
+                    Image.fromarray(self.latest_topdown_rgb).save(topdown_path)
                 return image_path
             else:
                 img = Image.fromarray(self.env.last_event.frame)
@@ -420,6 +476,12 @@ class EBNavigationEnv(gym.Env):
                 # draw_target_box(img, self.env.last_event.instance_detections2D, self.episode_data["targetObjectIds"], image_path)
                 # else:
                 draw_boxes(img,self.env.last_event.instance_detections2D, image_path)
+                if self.latest_topdown_rgb is not None:
+                    topdown_path = os.path.join(
+                        self.log_path,
+                        'episode_{}_step_{}_{}_topdown.png'.format(episode_idx, self._current_step, time_stamp)
+                    )
+                    Image.fromarray(self.latest_topdown_rgb).save(topdown_path)
                 # img.save(image_path)
                 return image_path
 

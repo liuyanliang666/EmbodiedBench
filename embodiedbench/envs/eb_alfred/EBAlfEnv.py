@@ -151,6 +151,8 @@ class EBAlfEnv(gym.Env):
         self.detection = detection_box # add detection in image
         self.name_to_id_dict = None
         self.id_to_name_dict = None
+        self.topdown_builder = None
+        self.latest_topdown_rgb = None
         self.language_skill_set = get_global_action_space()
         self.action_space = gym.spaces.Discrete(len(self.language_skill_set))
 
@@ -286,9 +288,8 @@ class EBAlfEnv(gym.Env):
         self._current_step = 0
         self._cur_invalid_actions = 0
         self._current_episode_num += 1
-        obs = {
-            'head_rgb': self.env.last_event.frame,
-        }
+        self._reset_topdown_builder()
+        obs = self._get_observation()
         self._reset = True
         self.episode_log = []
         self._episode_start_time = time.time()
@@ -330,9 +331,7 @@ class EBAlfEnv(gym.Env):
         info['task_success'] = float(self.env.get_goal_satisfied())
         info['task_progress'] = subgoal_met[0] / subgoal_met[1]
 
-        obs = {
-            'head_rgb': self.env.last_event.frame,
-        }
+        obs = self._get_observation()
         # if exceed the maximum episode steps or the goal is achieved
         if self._current_step >= self._max_episode_steps or info['task_success'] or self._cur_invalid_actions >= self._max_invalid_actions:
             done = True
@@ -359,6 +358,42 @@ class EBAlfEnv(gym.Env):
         info['reasoning'] = reasoning
         self.episode_log.append(info)
         return obs, reward, done, info
+
+    def _build_topdown_builder(self, reachable_positions=None):
+        from embodiedbench.envs.eb_alfred.topdown_mapping import AlfredTopdownBuilder, AlfredTopdownConfig, RenderBounds
+
+        initial_bounds = None
+        if reachable_positions:
+            padding = 1.5
+            thor_x_vals = [p["x"] for p in reachable_positions]
+            thor_z_vals = [p["z"] for p in reachable_positions]
+            # topdown coordinate: x = THOR z, y = -THOR x
+            initial_bounds = RenderBounds(
+                min_x=min(thor_z_vals) - padding,
+                max_x=max(thor_z_vals) + padding,
+                min_y=-max(thor_x_vals) - padding,
+                max_y=-min(thor_x_vals) + padding,
+            )
+
+        return AlfredTopdownBuilder(
+            AlfredTopdownConfig(output_size=(self.resolution, self.resolution)),
+            initial_bounds=initial_bounds,
+        )
+
+    def _reset_topdown_builder(self):
+        event = self.env.step(dict(action="GetReachablePositions"))
+        reachable = event.metadata["actionReturn"]
+        self.topdown_builder = self._build_topdown_builder(reachable)
+        self.latest_topdown_rgb = None
+
+    def _get_observation(self):
+        obs = {
+            'head_rgb': self.env.last_event.frame,
+        }
+        if self.topdown_builder is not None:
+            self.latest_topdown_rgb = self.topdown_builder.add_event(self.env.last_event)
+            obs['topdown_rgb'] = self.latest_topdown_rgb
+        return obs
     
     def get_env_feedback(self, info):
         """
@@ -392,6 +427,13 @@ class EBAlfEnv(gym.Env):
             else:
                 message = raw_message
             msg += f"Last action is invalid. {message}"
+        # Append current inventory state so the agent always knows what it's holding
+        inventory = self.env.last_event.metadata.get('inventoryObjects', [])
+        if inventory:
+            held_name = inventory[0]['objectType']
+            msg += f" Currently holding: {held_name}."
+        else:
+            msg += " Currently holding: nothing."
         return msg
     
     def seed(self, seed=None):
@@ -411,6 +453,12 @@ class EBAlfEnv(gym.Env):
         # time_stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
         image_path = os.path.join(folder, 'episode_{}_step_{}.png'.format(episode_idx, self._current_step)) #, time_stamp))
         img.save(image_path)
+        if self.latest_topdown_rgb is not None:
+            topdown_path = os.path.join(
+                folder,
+                'episode_{}_step_{}_topdown.png'.format(episode_idx, self._current_step)
+            )
+            Image.fromarray(self.latest_topdown_rgb).save(topdown_path)
         return image_path
 
     def save_episode_log(self):

@@ -23,6 +23,7 @@ class EBNavigationPlanner(VLMPlanner):
         memory_compression=False,
         segment_len=1,
         use_easyr1_format=False,
+        use_topdown_prompt=False,
         kwargs=None,
     ):
         unsupported_features = []
@@ -58,5 +59,6 @@ class EBNavigationPlanner(VLMPlanner):
             segment_len=segment_len,
             enable_point_actions=False,
             use_easyr1_format=use_easyr1_format,
+            use_topdown_prompt=use_topdown_prompt,
             kwargs=planner_kwargs,
         )

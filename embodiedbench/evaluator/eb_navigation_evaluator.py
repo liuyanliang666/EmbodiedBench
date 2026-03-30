@@ -29,6 +29,11 @@ class EB_NavigationEvaluator():
         self.planner = None
         self.max_invalid_planner_outputs = 10
 
+    def _planner_input(self, obs, img_path):
+        if self.planner is not None and getattr(self.planner, 'use_topdown_prompt', False):
+            return obs
+        return img_path
+
     def check_config_valid(self):
         if self.config.get('multiview', 0):
             logger.warning("multiview is not supported by the updated eb-nav planner. Disabling it.")
@@ -83,12 +88,16 @@ class EB_NavigationEvaluator():
                 multistep=self.config.get('multistep', 0),
                 resolution=self.config['resolution'],
                 selected_indexes=self.config.get('selected_indexes', []),
+                use_topdown_prompt=self.config.get('use_topdown_prompt', 0),
             )
 
             model_type = self.config.get('model_type', 'remote')
+            use_topdown_prompt = bool(self.config.get('use_topdown_prompt', 0))
             use_easyr1_format = self.config.get('easyr1_format')
             if use_easyr1_format is None:
                 use_easyr1_format = (model_type == 'custom' or 'easyr1' in self.model_name.lower())
+            if use_topdown_prompt:
+                use_easyr1_format = True
 
             self.planner = EBNavigationPlanner(
                 model_name=self.model_name,
@@ -109,6 +118,8 @@ class EB_NavigationEvaluator():
                 memory_compression=self.config.get('memory_compression', 0),
                 segment_len=self.config.get('segment_len', 1),
                 use_easyr1_format=use_easyr1_format,
+                use_topdown_prompt=use_topdown_prompt,
+                kwargs={'image_resolution': self.config.get('resolution', 600)},
             )
 
             self.evaluate()
@@ -154,7 +165,7 @@ class EB_NavigationEvaluator():
 
             while not done:
                 try:
-                    action, reasoning = self.planner.act(img_path, user_instruction)
+                    action, reasoning = self.planner.act(self._planner_input(obs, img_path), user_instruction)
                     print(f"Planner Output Action: {action}")
 
                     if action == -2:
@@ -239,6 +250,7 @@ if __name__ == '__main__':
         'visual': 0,
         'env_feedback': 1,
         'easyr1_format': None,
+        'use_topdown_prompt': 0,
         'memory_compression': 0,
         'segment_len': 1,
     }

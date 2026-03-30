@@ -15,7 +15,8 @@ from embodiedbench.main import logger
 class VLMPlanner():
     def __init__(self, model_name, model_type, actions, system_prompt, examples, n_shot=0, obs_key='head_rgb', 
                 chat_history=False, language_only=False, use_feedback=True, multistep=0, tp=1,
-                memory_compression=False, segment_len=1, enable_point_actions=False, use_easyr1_format=False, kwargs={}):
+                memory_compression=False, segment_len=1, enable_point_actions=False, use_easyr1_format=False,
+                use_topdown_prompt=False, kwargs={}):
         self.model_name = model_name
         self.obs_key = obs_key
         self.system_prompt = system_prompt
@@ -24,6 +25,24 @@ class VLMPlanner():
         self.chat_history = chat_history # whether to includ all the chat history for prompting
         self.set_actions(actions)
         self.model_type = model_type
+        self.use_topdown_prompt = bool(use_topdown_prompt)
+        self.use_easyr1_format = bool(use_easyr1_format or self.use_topdown_prompt)
+        self.kwargs = dict(kwargs)
+        self.action_key = self.kwargs.pop('action_key', 'action_id')
+        self.image_resolution = int(self.kwargs.pop('image_resolution', 600))
+        self.topdown_obs_key = str(self.kwargs.pop('topdown_obs_key', 'topdown_rgb'))
+        self.prompt_template_path = self.kwargs.pop(
+            'prompt_template_path',
+            os.path.join(os.path.dirname(__file__), 'prompt_templates', 'alfred.jinja')
+        )
+        self.topdown_prompt_template_path = self.kwargs.pop(
+            'topdown_prompt_template_path',
+            os.path.join(os.path.dirname(__file__), 'prompt_templates', 'alfred_topdown.jinja')
+        )
+        self._prompt_template = None
+        self._topdown_prompt_template = None
+        self.easyr1_variant = str(self.kwargs.pop('easyr1_variant', 'default')).strip().lower()
+        self.easyr1_navigation_only = (self.easyr1_variant == 'navigation')
         if model_type == 'custom':
             self.model = CustomModel(model_name, language_only)
         else:
@@ -32,7 +51,7 @@ class VLMPlanner():
                 model_type,
                 language_only,
                 tp=tp,
-                use_easyr1_format=use_easyr1_format,
+                use_easyr1_format=self.use_easyr1_format,
             )
 
         self.use_feedback = use_feedback
@@ -46,12 +65,6 @@ class VLMPlanner():
         except (TypeError, ValueError):
             self.segment_len = 1
         self.enable_point_actions = enable_point_actions
-        self.use_easyr1_format = use_easyr1_format
-        self.kwargs = dict(kwargs)
-        self.action_key = self.kwargs.pop('action_key', 'action_id')
-        self.image_resolution = int(self.kwargs.pop('image_resolution', 600))
-        self.easyr1_variant = str(self.kwargs.pop('easyr1_variant', 'default')).strip().lower()
-        self.easyr1_navigation_only = (self.easyr1_variant == 'navigation')
         self.reset()
     
     def set_actions(self, actions):
@@ -120,9 +133,15 @@ class VLMPlanner():
             )
         else:
             self.episode_memory = ""
+        # Update inventory state from latest feedback
+        if info is not None:
+            inventory_line = self._extract_inventory_line([[None, info.get('env_feedback', '')]])
+            self.episode_inventory = inventory_line or ""
 
     def _build_memory_prompt(self, user_instruction):
         prompt = self._build_initial_prompt(user_instruction)
+        if self.episode_inventory:
+            prompt += f"\n\n{self.episode_inventory}"
         if self.episode_memory:
             prompt += f"\n\n{self.episode_memory}"
         return prompt
@@ -170,61 +189,75 @@ class VLMPlanner():
             else:
                 prompt += f'''\n\n Considering the above interaction history and the current image state, to achieve the human instruction: '{user_instruction}', you are supposed to output in json. You need to describe current visual state from the image, summarize interaction history {'and environment feedback ' if self.use_feedback else ''}and reason why the last action or plan failed and did not finish the task, output your new plan to achieve the goal from current state. At the end, output the excutable plan with action ids(0 ~ {len(self.actions)-1}) from the available actions.'''
         return prompt
+    @staticmethod
+    def _extract_inventory_line(prev_act_feedback):
+        """Extract the most recent 'Currently holding' status from feedback history."""
+        if not prev_act_feedback:
+            return None
+        last_feedback = prev_act_feedback[-1]
+        feedback_text = last_feedback[1] if isinstance(last_feedback, (list, tuple)) and len(last_feedback) >= 2 else ''
+        if not isinstance(feedback_text, str):
+            return None
+        import re
+        m = re.search(r'Currently holding: ([^.]+)\.', feedback_text)
+        if m:
+            held = m.group(1).strip()
+            if held.lower() == 'nothing':
+                return 'You are currently holding nothing in your hand.'
+            return f'You are currently holding: {held}.'
+        return None
+
     def _build_easyr1_prompt(self, user_instruction, prev_act_feedback=[]):
         if self.easyr1_navigation_only:
+            if self.use_topdown_prompt:
+                return self._build_navigation_topdown_easyr1_prompt(user_instruction)
             return self._build_navigation_easyr1_prompt(user_instruction)
+        if self.use_topdown_prompt:
+            return self._build_topdown_easyr1_prompt(user_instruction, prev_act_feedback)
 
         task = user_instruction.strip().rstrip('.')
-        lines = [
-            'You are a household Navigation and Interaction Robot. Given the current first-person photo and the task below, your goal is to predict the next optimal discrete action.',
-            f"Task: {task}",
-            'You need to use your prior knowledge about household layouts, object affordances, and typical spatial relationships to complete the task.',
-            '',
-            'Your action must be chosen from the following list and formatted as a JSON array containing a single object. Each object must contain an "action_type" and a "parameter".',
-            'You must output exactly ONE next action per turn (array length must be 1). Do not output multiple actions, plans, or alternative candidates.',
-            '',
-            'Navigation Actions (Moving and adjusting view):',
-            "For these actions, the 'parameter' is a string indicating the direction.",
-            '- Moves the robot forward by 25cm: [{"action_type": "Move", "parameter": "forward"}]',
-            '- Moves the robot backward by 25cm: [{"action_type": "Move", "parameter": "backward"}]',
-            '- Rotates the robot\'s perspective 90 degrees to the right: [{"action_type": "Rotate", "parameter": "right"}]',
-            '- Rotates the robot\'s perspective 90 degrees to the left: [{"action_type": "Rotate", "parameter": "left"}]',
-            '- Tilts the camera up by 15 degrees to inspect higher areas: [{"action_type": "Look", "parameter": "up"}]',
-            '- Tilts the camera down by 15 degrees to inspect lower areas or the ground: [{"action_type": "Look", "parameter": "down"}]',
-            '',
-            'Interaction Actions (Manipulating objects):',
-            "For these actions, the 'action_type' is the specific action name, and you MUST provide a 2D array [x, y] as the 'parameter'. The [x, y] represents the pixel coordinates of the target object in the 600x600 image (where (0, 0) is the top-left corner, x is horizontal width, y is vertical height).",
-            '- Pick up a target object: [{"action_type": "PickupObject", "parameter": [x, y]}]',
-            '- Put down an object currently held: [{"action_type": "PutObject", "parameter": [x, y]}]',
-            '- Open an object (e.g., cabinet, drawer, fridge): [{"action_type": "OpenObject", "parameter": [x, y]}]',
-            '- Close an object: [{"action_type": "CloseObject", "parameter": [x, y]}]',
-            '- Turn on an appliance or light: [{"action_type": "ToggleObjectOn", "parameter": [x, y]}]',
-            '- Turn off an appliance or light: [{"action_type": "ToggleObjectOff", "parameter": [x, y]}]',
-            '- Slice an object (e.g., apple, bread) with a knife: [{"action_type": "SliceObject", "parameter": [x, y]}]',
-            '',
-            'Output the thinking process in <think> </think> tags, and the final JSON answer in <answer> </answer> tags as follows:',
-            'In <answer>, output only one JSON action object wrapped in a one-element array.',
-            '<think> ... </think> <answer> answer here </answer>',
-            '',
-            'Examples:',
-            '',
-            '<think> The task is to \'Slice an apple\'. I currently see an apple on the counter in front of me, and I am already holding a knife. The apple is located around the center-right of the image. I should use the SliceObject action to complete the task. </think> <answer> [{"action_type": "SliceObject", "parameter": [450, 320]}] </answer>',
-            '',
-            '<think> The task is to \'Find a mug\'. I am currently facing a blank wall in the kitchen. I need to explore the environment to find counters or cabinets where a mug might be. Rotating to the right will give me a new view of the room. </think> <answer> [{"action_type": "Rotate", "parameter": "right"}] </answer>',
-            '',
-            '<think> The task is to \'Pick up the remote control\'. I am looking down at a coffee table and see the remote control resting near the top left corner of my view. It is within reach. I should execute a pickup action at those coordinates. </think> <answer> [{"action_type": "PickupObject", "parameter": [150, 200]}] </answer>',
-            '',
-            '<think> The task is to \'Open the bottom drawer\'. I am standing right in front of the drawer, but I am too close and looking straight ahead, so the handle is cut off at the bottom edge of my vision. I should move backward to get a better view of the lower cabinets before attempting to interact. </think> <answer> [{"action_type": "Move", "parameter": "backward"}] </answer>',
-            '',
-            '<think> The task is to \'Cool the tomato\'. I am holding a tomato and standing directly in front of the refrigerator. To cool the tomato, I first need to open the fridge door. The handle is visible on the left side of the fridge door. </think> <answer> [{"action_type": "OpenObject", "parameter": [200, 300]}] </answer>',
-        ]
-        return "\n".join(lines)
+        template_text = self._load_prompt_template()
+        content = '\n'.join([f'Task: {task}.', '<image>'])
+        prompt = template_text.replace('{{ content | trim }}', content)
+        inventory_line = self._extract_inventory_line(prev_act_feedback)
+        if inventory_line:
+            prompt += f'\n\n{inventory_line}'
+        return prompt
+
+    def _load_prompt_template(self):
+        if self._prompt_template is None:
+            with open(self.prompt_template_path, 'r', encoding='utf-8') as handle:
+                self._prompt_template = handle.read()
+        return self._prompt_template
+
+    def _load_topdown_prompt_template(self):
+        if self._topdown_prompt_template is None:
+            with open(self.topdown_prompt_template_path, 'r', encoding='utf-8') as handle:
+                self._topdown_prompt_template = handle.read()
+        return self._topdown_prompt_template
+
+    def _build_topdown_easyr1_prompt(self, user_instruction, prev_act_feedback=[]):
+        task = user_instruction.strip().rstrip('.')
+        template_text = self._load_topdown_prompt_template()
+        content = '\n'.join([
+            f'Task: {task}.',
+            'Current first-person view:',
+            '<image>',
+            'Reconstructed top-down occupancy map from the trajectory observed so far:',
+            '<image>',
+        ])
+        prompt = template_text.replace('{{ content | trim }}', content)
+        inventory_line = self._extract_inventory_line(prev_act_feedback)
+        if inventory_line:
+            prompt += f'\n\n{inventory_line}'
+        return prompt
 
     def _build_navigation_easyr1_prompt(self, user_instruction):
         task = user_instruction.strip().rstrip('.')
         lines = [
             'You are a household navigation robot. Given the current first-person photo and the task below, your goal is to predict the next optimal discrete navigation action.',
             f"Task: {task}",
+            '<image>',
             'You need to use your prior knowledge about household layouts, target visibility, obstacles, and egocentric motion to move closer to the target object.',
             '',
             'Your action must be chosen from the following navigation-only list and formatted as a JSON array containing a single object. Each object must contain an "action_type" and a "parameter".',
@@ -248,6 +281,52 @@ class VLMPlanner():
             '<think> The target object is not visible in the current frame. I should rotate right to explore the room and search for it. </think> <answer> [{"action_type": "Rotate", "parameter": "right"}] </answer>',
             '',
             '<think> I can already see the target object directly ahead, but it is still a few steps away. The best next action is to move forward. </think> <answer> [{"action_type": "Move", "parameter": "forward"}] </answer>',
+            '',
+            '<think> I am too close to a wall and need a slightly wider view before continuing toward the target. I should move backward first. </think> <answer> [{"action_type": "Move", "parameter": "backward"}] </answer>',
+            '',
+            '<think> The target seems lower than my current viewpoint and may be hidden by the countertop edge. I should tilt the camera down by 15 degrees. </think> <answer> [{"action_type": "Look", "parameter": "down"}] </answer>',
+            '',
+            '<think> The target is likely on a high shelf and not visible from the current camera pitch. I should tilt the camera up by 15 degrees. </think> <answer> [{"action_type": "Look", "parameter": "up"}] </answer>',
+        ]
+        return "\n".join(lines)
+
+    def _build_navigation_topdown_easyr1_prompt(self, user_instruction):
+        task = user_instruction.strip().rstrip('.')
+        lines = [
+            'You are a household navigation robot. Given the current first-person photo, the reconstructed top-down occupancy map, and the task below, your goal is to predict the next optimal discrete navigation action.',
+            f"Task: {task}.",
+            'Current first-person view:',
+            '<image>',
+            'Reconstructed top-down occupancy map from the trajectory observed so far:',
+            '<image>',
+            'You need to use your prior knowledge about household layouts, target visibility, obstacles, and egocentric motion to move closer to the target object.',
+            '',
+            'The first image is the current first-person photo. The second image is a reconstructed top-down occupancy map accumulated from the trajectory observed so far.',
+            "In the top-down map, the blue arrow marks the robot's current location, and the direction the blue arrow points is the robot's current facing direction.",
+            'In the top-down map, white regions indicate occupied obstacles, and black regions indicate non-occupied open space that is more likely to be traversable.',
+            'Use the top-down map to reason about explored free space, room layout, obstacles, and navigation progress. Use the first-person photo to decide what is currently visible.',
+            '',
+            'Your action must be chosen from the following navigation-only list and formatted as a JSON array containing a single object. Each object must contain an "action_type" and a "parameter".',
+            'You must output exactly ONE next action per turn (array length must be 1). Do not output multiple actions, plans, or alternative candidates.',
+            '',
+            'Navigation Actions:',
+            "For these actions, the 'parameter' is a string indicating the direction.",
+            '- Moves the robot forward by 25cm: [{"action_type": "Move", "parameter": "forward"}]',
+            '- Moves the robot backward by 25cm: [{"action_type": "Move", "parameter": "backward"}]',
+            '- Rotates the robot perspective 90 degrees to the right: [{"action_type": "Rotate", "parameter": "right"}]',
+            '- Rotates the robot perspective 90 degrees to the left: [{"action_type": "Rotate", "parameter": "left"}]',
+            '- Tilts the camera up by 15 degrees: [{"action_type": "Look", "parameter": "up"}]',
+            '- Tilts the camera down by 15 degrees: [{"action_type": "Look", "parameter": "down"}]',
+            '',
+            'Output the thinking process in <think> </think> tags, and the final JSON answer in <answer> </answer> tags as follows:',
+            'In <answer>, output only one JSON action object wrapped in a one-element array.',
+            '<think> ... </think> <answer> answer here </answer>',
+            '',
+            'Examples:',
+            '',
+            '<think> The target object is not visible in the current first-person image. The top-down map shows unexplored free space on the robot\'s right side, so rotating right is the most useful next navigation action. </think> <answer> [{"action_type": "Rotate", "parameter": "right"}] </answer>',
+            '',
+            '<think> I can already see the target object directly ahead, and the top-down map shows free space in front of the agent. The best next action is to move forward. </think> <answer> [{"action_type": "Move", "parameter": "forward"}] </answer>',
             '',
             '<think> I am too close to a wall and need a slightly wider view before continuing toward the target. I should move backward first. </think> <answer> [{"action_type": "Move", "parameter": "backward"}] </answer>',
             '',
@@ -629,6 +708,50 @@ class VLMPlanner():
         return None
     
 
+    def _materialize_image_path(self, image, prefix):
+        if image is None:
+            return None
+        if isinstance(image, str):
+            return image
+
+        os.makedirs('./evaluation', exist_ok=True)
+        image_path = './evaluation/tmp_{}_{}_{}.png'.format(prefix, self.planner_steps, len(prefix))
+        cv2.imwrite(image_path, image)
+        return image_path
+
+    def _get_topdown_image_paths(self, image):
+        if not isinstance(image, dict):
+            raise ValueError("Topdown prompt expects an observation dict with head_rgb and topdown_rgb.")
+
+        head_path = self._materialize_image_path(image.get(self.obs_key), self.obs_key)
+        topdown_path = self._materialize_image_path(image.get(self.topdown_obs_key), self.topdown_obs_key)
+        if head_path is None or topdown_path is None:
+            raise ValueError("Missing head_rgb or topdown_rgb for topdown prompt.")
+        return [head_path, topdown_path]
+
+    def _get_custom_model_observation(self, obs):
+        if self.use_topdown_prompt:
+            return self._get_topdown_image_paths(obs)
+
+        if isinstance(obs, dict):
+            obs = obs.get(self.obs_key)
+        return self._materialize_image_path(obs, self.obs_key)
+
+    @staticmethod
+    def _build_interleaved_content(prompt, image_data_urls):
+        """Split prompt on <image> placeholders and interleave image_url objects."""
+        segments = prompt.split('<image>')
+        content = []
+        for i, seg in enumerate(segments):
+            if seg.strip():
+                content.append({"type": "text", "text": seg})
+            if i < len(image_data_urls):
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": image_data_urls[i]}
+                })
+        return content
+
     def get_message(self, image, prompt, messages=[]):
         if self.language_only:
             return messages + [
@@ -639,6 +762,28 @@ class VLMPlanner():
                 }
             ]
         else:
+            if self.use_topdown_prompt:
+                image_data_urls = [
+                    local_image_to_data_url(image_path=p)
+                    for p in self._get_topdown_image_paths(image)
+                ]
+                if self.use_easyr1_format and '<image>' in prompt:
+                    content = self._build_interleaved_content(prompt, image_data_urls)
+                else:
+                    content = []
+                    for url in image_data_urls:
+                        content.append({
+                            "type": "image_url",
+                            "image_url": {"url": url}
+                        })
+                    content.append({"type": "text", "text": prompt})
+                return messages + [
+                    {
+                        "role": "user",
+                        "content": content,
+                    }
+                ]
+
             if type(image) == str:
                 image_path = image 
             elif self.multistep and isinstance(image, (list, tuple)):
@@ -670,7 +815,10 @@ class VLMPlanner():
                                 }})
             else:
                 data_url = local_image_to_data_url(image_path=image_path)
-                content = [{ "type": "image_url", "image_url": { "url": data_url,}}, {"type": "text", "text": prompt}]
+                if self.use_easyr1_format and '<image>' in prompt:
+                    content = self._build_interleaved_content(prompt, [data_url])
+                else:
+                    content = [{ "type": "image_url", "image_url": { "url": data_url,}}, {"type": "text", "text": prompt}]
 
             return messages + [
                 {
@@ -684,6 +832,7 @@ class VLMPlanner():
         self.episode_messages = []
         self.episode_act_feedback = []
         self.episode_memory = ""
+        self.episode_inventory = ""
         self.steps_since_memory_refresh = 0
         self.planner_steps = 0
         self.output_json_error = 0
@@ -760,8 +909,7 @@ class VLMPlanner():
     
         
     def act_custom(self, prompt, obs):
-        assert type(obs) == str # input image path
-        out = self.model.respond(prompt, obs)
+        out = self.model.respond(prompt, self._get_custom_model_observation(obs))
         print(f"Model Output:\n{out}\n")
         # fix common generated json errors
         if not self.use_easyr1_format:
@@ -774,7 +922,7 @@ class VLMPlanner():
 
     def act(self, observation, user_instruction):
         if type(observation) == dict:
-            obs = observation[self.obs_key]
+            obs = observation if self.use_topdown_prompt else observation[self.obs_key]
         else:
             obs = observation # input image path
         

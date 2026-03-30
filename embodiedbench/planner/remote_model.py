@@ -1,4 +1,5 @@
 import json
+import io
 import sys
 import os
 import base64
@@ -8,6 +9,7 @@ from openai import OpenAI
 import typing_extensions as typing
 import lmdeploy
 from lmdeploy import pipeline, GenerationConfig, PytorchEngineConfig
+from PIL import Image
 from embodiedbench.planner.planner_config.generation_guide import llm_generation_guide, vlm_generation_guide
 from embodiedbench.planner.planner_config.generation_guide_manip import llm_generation_guide_manip, vlm_generation_guide_manip
 from embodiedbench.planner.planner_utils import convert_format_2claude, convert_format_2gemini, ActionPlan_1, ActionPlan, ActionPlan_lang, \
@@ -16,6 +18,12 @@ from embodiedbench.planner.planner_utils import convert_format_2claude, convert_
 temperature = 0
 max_completion_tokens = 2048
 remote_url = os.environ.get('remote_url')
+
+_DEFAULT_SYSTEM_PROMPT_PREFIXES = (
+    "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n",
+    "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n",
+)
+_QWEN_VISION_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
 
 class RemoteModel:
     def __init__(
@@ -36,6 +44,19 @@ class RemoteModel:
         if self.model_type == 'local':
             backend_config = PytorchEngineConfig(session_len=12000, dtype='float16', tp=tp)
             self.model = pipeline(self.model_name, backend_config=backend_config)
+        elif self.model_type == 'hf_local':
+            import torch
+            from transformers import AutoProcessor, AutoModelForVision2Seq, AutoModelForCausalLM
+            self.processor = AutoProcessor.from_pretrained(self.model_name)
+            try:
+                self.model = AutoModelForVision2Seq.from_pretrained(
+                    self.model_name, torch_dtype=torch.float16, device_map="auto",
+                )
+            except ValueError:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name, torch_dtype=torch.float16, device_map="auto",
+                )
+            self.model.eval()
         else:
             if "claude" in self.model_name:
                 self.model = anthropic.Anthropic(
@@ -76,6 +97,8 @@ class RemoteModel:
     def respond(self, message_history: list):
         if self.model_type == 'local':
             return self._call_local(message_history)
+        elif self.model_type == 'hf_local':
+            return self._call_hf_local(message_history)
         else:
             if "claude" in self.model_name:
                 return self._call_claude(message_history)
@@ -106,7 +129,7 @@ class RemoteModel:
             # elif "OpenGVLab/InternVL2_5-78B" in self.model_name:
             #     return self._call_intern38b(message_history)
             else:
-                raise ValueError(f"Unsupported model name: {self.model_name}")
+                return self._call_openai_text(message_history)
 
     def _call_openai_text(self, message_history: list, model_name=None):
         response = self.model.chat.completions.create(
@@ -154,6 +177,135 @@ class RemoteModel:
         )
         out = response.text
         out = fix_json(out)
+        return out
+
+    @staticmethod
+    def _extract_images_from_messages(message_history):
+        """Convert OpenAI-format messages to a processor-friendly message format.
+
+        Replaces ``image_url`` items (with base64 data URLs) with
+        ``{"type": "image"}`` and extracts the corresponding PIL images.
+
+        Returns:
+            hf_messages: transformed message list for prompt serialization
+            pil_images:  list of PIL.Image in order of appearance
+        """
+        pil_images = []
+        hf_messages = []
+        for msg in message_history:
+            new_msg = {"role": msg["role"]}
+            content = msg.get("content")
+            if isinstance(content, str):
+                new_msg["content"] = content
+                hf_messages.append(new_msg)
+                continue
+            new_content = []
+            for item in (content or []):
+                if item.get("type") == "image_url":
+                    url = item["image_url"]["url"]
+                    _, b64_data = url.split(",", 1)
+                    image_bytes = base64.b64decode(b64_data)
+                    pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                    pil_images.append(pil_img)
+                    new_content.append({"type": "image"})
+                else:
+                    new_content.append(item)
+            new_msg["content"] = new_content
+            hf_messages.append(new_msg)
+        return hf_messages, pil_images
+
+    @staticmethod
+    def _is_qwen_model_name(model_name):
+        lowered = (model_name or "").lower()
+        return "qwen" in lowered
+
+    @classmethod
+    def _serialize_qwen_content(cls, content):
+        if isinstance(content, str):
+            return content
+        if content is None:
+            return ""
+        if not isinstance(content, list):
+            raise TypeError(f"Unsupported Qwen message content type: {type(content)!r}")
+
+        parts = []
+        for item in content:
+            item_type = item.get("type")
+            if item_type == "text":
+                parts.append(item.get("text", ""))
+            elif item_type in {"image", "image_url"}:
+                parts.append(_QWEN_VISION_PLACEHOLDER)
+            else:
+                raise ValueError(f"Unsupported Qwen content item type: {item_type}")
+        return "".join(parts)
+
+    @classmethod
+    def _build_qwen_prompt_text(cls, messages, add_generation_prompt=True):
+        parts = []
+        for message in messages:
+            role = message.get("role", "user")
+            parts.append(f"<|im_start|>{role}\n")
+            parts.append(cls._serialize_qwen_content(message.get("content")))
+            parts.append("<|im_end|>\n")
+        if add_generation_prompt:
+            parts.append("<|im_start|>assistant\n")
+        return "".join(parts)
+
+    def _render_hf_local_prompt(self, hf_messages):
+        if self._is_qwen_model_name(self.model_name):
+            return self._build_qwen_prompt_text(hf_messages, add_generation_prompt=True)
+
+        prompt_text = self.processor.apply_chat_template(
+            hf_messages, add_generation_prompt=True, tokenize=False,
+        )
+
+        # Strip default Qwen system prompt injected by apply_chat_template
+        # (matches EasyR1 _strip_leading_default_system_prompt behaviour)
+        if not hf_messages or hf_messages[0].get("role") != "system":
+            for prefix in _DEFAULT_SYSTEM_PROMPT_PREFIXES:
+                if prompt_text.startswith(prefix):
+                    prompt_text = prompt_text[len(prefix):]
+                    break
+        return prompt_text
+
+    def _call_hf_local(self, message_history: list):
+        """Local inference using HF AutoModelForCausalLM + AutoProcessor.
+
+        Tokenisation matches EasyR1 / DeepEyes training exactly.
+        """
+        import torch
+
+        hf_messages, pil_images = self._extract_images_from_messages(message_history)
+        prompt_text = self._render_hf_local_prompt(hf_messages)
+
+        if pil_images:
+            inputs = self.processor(
+                text=[prompt_text], images=pil_images, return_tensors="pt",
+            )
+        else:
+            inputs = self.processor(
+                text=[prompt_text], return_tensors="pt",
+            )
+
+        inputs = {
+            k: v.to(self.model.device) if isinstance(v, torch.Tensor) else v
+            for k, v in inputs.items()
+        }
+
+        prompt_len = inputs["input_ids"].shape[1]
+        with torch.inference_mode():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_completion_tokens,
+                do_sample=(temperature > 0),
+                temperature=temperature if temperature > 0 else None,
+            )
+
+        generated_ids = output_ids[:, prompt_len:]
+        out = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+        if not self.use_easyr1_format:
+            out = fix_json(out)
         return out
 
     def _call_claude(self, message_history: list):

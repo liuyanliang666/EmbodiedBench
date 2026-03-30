@@ -45,6 +45,11 @@ class EB_AlfredEvaluator():
         with open(os.path.join(res_path, filename), 'w', encoding='utf-8') as f:
             json.dump(episode_info, f, ensure_ascii=False)
 
+    def _planner_input(self, obs, img_path):
+        if self.planner is not None and getattr(self.planner, 'use_topdown_prompt', False):
+            return obs
+        return img_path
+
     def evaluate_main(self):
         self.check_config_valid()
         valid_eval_sets = self.config.get('eval_sets', ValidEvalSets)
@@ -65,15 +70,19 @@ class EB_AlfredEvaluator():
                                           )
             examples = json.load(open(example_path, 'r+')) if self.eval_set != 'long_horizon' else json.load(open(exploration_example_path, 'r+'))
             model_type = self.config.get('model_type', 'remote')
+            use_topdown_prompt = bool(self.config.get('use_topdown_prompt', 0))
             use_easyr1_format = self.config.get('easyr1_format')
             if use_easyr1_format is None:
                 use_easyr1_format = (model_type == 'custom' or 'easyr1' in self.model_name.lower())
+            if use_topdown_prompt:
+                use_easyr1_format = True
             self.planner = VLMPlanner(self.model_name, model_type, self.env.language_skill_set, system_prompt, examples, n_shot=self.config['n_shots'], 
                                             obs_key='head_rgb', chat_history=self.config['chat_history'], language_only=self.config['language_only'],
                                             use_feedback=self.config.get('env_feedback', True), multistep=self.config.get('multistep', 0), tp=self.config.get('tp', 1),
                                             memory_compression=self.config.get('memory_compression', 0),
                                             segment_len=self.config.get('segment_len', 1),
                                             enable_point_actions=True, use_easyr1_format=use_easyr1_format,
+                                            use_topdown_prompt=use_topdown_prompt,
                                             kwargs={'image_resolution': self.config.get('resolution', 600)})
 
             self.evaluate()
@@ -115,7 +124,7 @@ class EB_AlfredEvaluator():
             done = False
             while not done:
                 try: 
-                    action, reasoning = self.planner.act(img_path, user_instruction)
+                    action, reasoning = self.planner.act(self._planner_input(obs, img_path), user_instruction)
                     print(f"Planner Output Action: {action}")
                     if action == -2: # empty plan stop here
                         episode_info['empty_plan'] = 1
@@ -205,6 +214,7 @@ if __name__ == '__main__':
         parser.add_argument('--env_feedback', type=int, help='Set to True to enable environment feedback.')
         parser.add_argument('--tp', type=int, help='number of tensor parallel splits of the model parameters')
         parser.add_argument('--easyr1_format', type=int, help='Set to True to use EasyR1 <think>/<answer> JSON action format.')
+        parser.add_argument('--use_topdown_prompt', type=int, help='Set to True to use the local EasyR1-style ALFRED topdown prompt with head_rgb and topdown_rgb.')
         parser.add_argument('--memory_compression', type=int, help='Set to True to enable compressed memory replanning.')
         parser.add_argument('--segment_len', type=int, help='Number of executed environment actions per memory refresh.')
         return parser.parse_args()
@@ -226,6 +236,7 @@ if __name__ == '__main__':
         'env_feedback': 1,
         'tp': 1,
         'easyr1_format': None,
+        'use_topdown_prompt': 0,
         'memory_compression': 0,
         'segment_len': 1,
     }

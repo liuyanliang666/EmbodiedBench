@@ -1,5 +1,7 @@
 import importlib
+import os
 import sys
+import tempfile
 import types
 import unittest
 
@@ -136,6 +138,22 @@ class DummyEvent:
 
 
 class AlfredFeedbackFormattingTests(unittest.TestCase):
+    def test_topdown_mapping_avoids_pep604_union_syntax(self):
+        source_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "..",
+            "embodiedbench",
+            "envs",
+            "eb_alfred",
+            "topdown_mapping.py",
+        )
+        with open(source_path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+
+        self.assertNotIn("| None", source)
+
     def test_open_by_point_failure_includes_state_and_hint(self):
         connector = ThorConnector.__new__(ThorConnector)
         target = {
@@ -244,6 +262,9 @@ class AlfredFeedbackFormattingTests(unittest.TestCase):
     def test_env_feedback_wraps_richer_invalid_message(self):
         env = EBAlfEnv.__new__(EBAlfEnv)
         env.id_to_name_dict = {}
+        env.env = types.SimpleNamespace(
+            last_event=types.SimpleNamespace(metadata={"inventoryObjects": []})
+        )
 
         feedback = env.get_env_feedback(
             {
@@ -258,8 +279,51 @@ class AlfredFeedbackFormattingTests(unittest.TestCase):
         self.assertEqual(
             feedback,
             "Last action is invalid. [open_api_failed] Failed to open Microwave "
-            "(Microwave|1). Object state: visible=True, openable=True, isOpen=False.",
+            "(Microwave|1). Object state: visible=True, openable=True, isOpen=False. "
+            "Currently holding: nothing.",
         )
+
+    def test_save_image_also_saves_topdown_view(self):
+        env = EBAlfEnv.__new__(EBAlfEnv)
+        env._current_episode_num = 1
+        env._current_step = 2
+        env.selected_indexes = []
+        env.log_path = ""
+        env.detection = False
+        env.id_to_name_dict = None
+        env.latest_topdown_rgb = [[1]]
+        env.env = types.SimpleNamespace(
+            last_event=types.SimpleNamespace(
+                frame=[[0]],
+                instance_detections2D={},
+            )
+        )
+
+        class DummySavedImage:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def save(self, path):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(str(self.payload))
+
+        original_fromarray = alfred_env_module.Image.fromarray
+        alfred_env_module.Image.fromarray = lambda value: DummySavedImage(value)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                env.log_path = tmpdir
+                image_path = env.save_image()
+                topdown_path = os.path.join(
+                    tmpdir,
+                    "images",
+                    "episode_1",
+                    "episode_1_step_2_topdown.png",
+                )
+
+                self.assertTrue(os.path.exists(image_path))
+                self.assertTrue(os.path.exists(topdown_path))
+        finally:
+            alfred_env_module.Image.fromarray = original_fromarray
 
 
 if __name__ == "__main__":
