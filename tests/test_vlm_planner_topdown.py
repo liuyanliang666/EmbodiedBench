@@ -174,6 +174,70 @@ class AlfredTopdownPlannerTests(unittest.TestCase):
         self.assertEqual(content[-1]["type"], "text")
         self.assertEqual(content[-1]["text"], "prompt text")
 
+    def test_get_message_vllm_direct_keeps_raw_single_image_object(self):
+        planner = VLMPlanner(
+            "dummy-model",
+            "vllm_direct",
+            actions=["MoveAhead"],
+            system_prompt="",
+            examples=[],
+            use_easyr1_format=True,
+            use_topdown_prompt=False,
+        )
+
+        raw_image = [[1, 2], [3, 4]]
+        messages = planner.get_message(raw_image, "Task: test.\n<image>")
+
+        content = messages[0]["content"]
+        image_items = [item for item in content if item["type"] == "image"]
+        self.assertEqual(len(image_items), 1)
+        self.assertIs(image_items[0]["image"], raw_image)
+        self.assertFalse(any(item["type"] == "image_url" for item in content))
+
+    def test_get_message_vllm_direct_trims_trailing_newline_on_last_text_segment(self):
+        planner = VLMPlanner(
+            "dummy-model",
+            "vllm_direct",
+            actions=["MoveAhead"],
+            system_prompt="",
+            examples=[],
+            use_easyr1_format=True,
+            use_topdown_prompt=False,
+        )
+
+        raw_image = [[1, 2], [3, 4]]
+        messages = planner.get_message(raw_image, "Task: test.\n<image>\nOutput one action.\n")
+
+        content = messages[0]["content"]
+        text_items = [item["text"] for item in content if item["type"] == "text"]
+        self.assertEqual(text_items[-1], "\nOutput one action.")
+
+    def test_get_message_vllm_direct_topdown_keeps_raw_image_objects(self):
+        planner = VLMPlanner(
+            "dummy-model",
+            "vllm_direct",
+            actions=["MoveAhead"],
+            system_prompt="",
+            examples=[],
+            use_easyr1_format=True,
+            use_topdown_prompt=True,
+        )
+
+        head = [[1]]
+        topdown = [[2]]
+        messages = planner.get_message(
+            {
+                "head_rgb": head,
+                "topdown_rgb": topdown,
+            },
+            "Task: test.\nCurrent first-person view:\n<image>\nReconstructed top-down occupancy map from the trajectory observed so far:\n<image>",
+        )
+
+        content = messages[0]["content"]
+        image_items = [item for item in content if item["type"] == "image"]
+        self.assertEqual([item["image"] for item in image_items], [head, topdown])
+        self.assertFalse(any(item["type"] == "image_url" for item in content))
+
     def test_custom_model_receives_two_images_when_topdown_enabled(self):
         planner = VLMPlanner(
             "dummy-model",

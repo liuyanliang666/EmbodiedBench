@@ -752,6 +752,41 @@ class VLMPlanner():
                 })
         return content
 
+    @staticmethod
+    def _build_interleaved_raw_content(prompt, raw_images):
+        """Split prompt on <image> placeholders and interleave raw image objects."""
+        segments = prompt.split('<image>')
+        content = []
+        for i, seg in enumerate(segments):
+            if seg.strip():
+                text = seg.rstrip("\n") if i == len(segments) - 1 else seg
+                content.append({"type": "text", "text": text})
+            if i < len(raw_images):
+                content.append({
+                    "type": "image",
+                    "image": raw_images[i],
+                })
+        return content
+
+    def _materialize_direct_image(self, image):
+        if image is None:
+            return None
+        if isinstance(image, str):
+            from PIL import Image
+
+            return Image.open(image).convert("RGB")
+        return image
+
+    def _get_topdown_raw_images(self, image):
+        if not isinstance(image, dict):
+            raise ValueError("Topdown prompt expects an observation dict with head_rgb and topdown_rgb.")
+
+        head_image = self._materialize_direct_image(image.get(self.obs_key))
+        topdown_image = self._materialize_direct_image(image.get(self.topdown_obs_key))
+        if head_image is None or topdown_image is None:
+            raise ValueError("Missing head_rgb or topdown_rgb for topdown prompt.")
+        return [head_image, topdown_image]
+
     def get_message(self, image, prompt, messages=[]):
         if self.language_only:
             return messages + [
@@ -762,6 +797,43 @@ class VLMPlanner():
                 }
             ]
         else:
+            if self.model_type == 'vllm_direct':
+                if self.use_topdown_prompt:
+                    raw_images = self._get_topdown_raw_images(image)
+                    if self.use_easyr1_format and '<image>' in prompt:
+                        content = self._build_interleaved_raw_content(prompt, raw_images)
+                    else:
+                        content = [{"type": "image", "image": img} for img in raw_images]
+                        content.append({"type": "text", "text": prompt})
+                    return messages + [
+                        {
+                            "role": "user",
+                            "content": content,
+                        }
+                    ]
+
+                if isinstance(image, dict):
+                    image = image.get(self.obs_key)
+
+                if self.multistep and isinstance(image, (list, tuple)):
+                    raw_images = [self._materialize_direct_image(img) for img in image[-self.multistep:]]
+                else:
+                    raw_image = self._materialize_direct_image(image)
+                    raw_images = [raw_image] if raw_image is not None else []
+
+                if self.use_easyr1_format and '<image>' in prompt:
+                    content = self._build_interleaved_raw_content(prompt, raw_images)
+                else:
+                    content = [{"type": "image", "image": img} for img in raw_images]
+                    content.append({"type": "text", "text": prompt})
+
+                return messages + [
+                    {
+                        "role": "user",
+                        "content": content,
+                    }
+                ]
+
             if self.use_topdown_prompt:
                 image_data_urls = [
                     local_image_to_data_url(image_path=p)

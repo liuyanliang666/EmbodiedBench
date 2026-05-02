@@ -59,58 +59,60 @@ def _install_remote_model_stub_dependencies():
     lmdeploy_mod.PytorchEngineConfig = DummyPytorchEngineConfig
     sys.modules["lmdeploy"] = lmdeploy_mod
 
+    class _FakeTensor:
+        def __init__(self, data=None, shape=None, dtype=None):
+            if shape is not None:
+                self._shape = tuple(shape)
+            elif data is not None:
+                self._shape = (len(data),) if isinstance(data, (list, tuple)) else (1,)
+            else:
+                self._shape = (1,)
+            self.dtype = dtype
+
+        @property
+        def shape(self):
+            return self._shape
+
+        def to(self, *_args, **_kwargs):
+            return self
+
+        def __getitem__(self, key):
+            return self
+
+    class _FakeDevice:
+        def __init__(self, name="cpu"):
+            self.type = name
+
+        def __repr__(self):
+            return f"device('{self.type}')"
+
+    def _ones(*size, dtype=None):
+        if len(size) == 1 and isinstance(size[0], (list, tuple)):
+            size = tuple(size[0])
+        return _FakeTensor(shape=size, dtype=dtype)
+
+    def _empty(*size, dtype=None):
+        return _FakeTensor(shape=size, dtype=dtype)
+
     # torch stub (for environments without GPU dependencies)
     if "torch" not in sys.modules:
         torch_mod = types.ModuleType("torch")
-
-        class _FakeTensor:
-            def __init__(self, data=None, shape=None, dtype=None):
-                if shape is not None:
-                    self._shape = tuple(shape)
-                elif data is not None:
-                    self._shape = (len(data),) if isinstance(data, (list, tuple)) else (1,)
-                else:
-                    self._shape = (1,)
-                self.dtype = dtype
-
-            @property
-            def shape(self):
-                return self._shape
-
-            def to(self, *_args, **_kwargs):
-                return self
-
-            def __getitem__(self, key):
-                return self
-
-        class _FakeDevice:
-            def __init__(self, name="cpu"):
-                self.type = name
-
-            def __repr__(self):
-                return f"device('{self.type}')"
-
-        def _ones(*size, dtype=None):
-            if len(size) == 1 and isinstance(size[0], (list, tuple)):
-                size = tuple(size[0])
-            return _FakeTensor(shape=size, dtype=dtype)
-
-        def _empty(*size, dtype=None):
-            return _FakeTensor(shape=size, dtype=dtype)
-
-        torch_mod.Tensor = _FakeTensor
-        torch_mod.device = _FakeDevice
-        torch_mod.ones = _ones
-        torch_mod.empty = _empty
-        torch_mod.float16 = "float16"
-        torch_mod.long = "long"
-        torch_mod.inference_mode = lambda: type("ctx", (), {"__enter__": lambda s: s, "__exit__": lambda s, *a: None})()
         sys.modules["torch"] = torch_mod
     import torch  # noqa: E402 — now always available
+    if not hasattr(torch, "Tensor"):
+        torch.Tensor = _FakeTensor
+    if not hasattr(torch, "device"):
+        torch.device = _FakeDevice
+    if not hasattr(torch, "ones"):
+        torch.ones = _ones
+    if not hasattr(torch, "empty"):
+        torch.empty = _empty
     if not hasattr(torch, "float16"):
         torch.float16 = "float16"
     if not hasattr(torch, "long"):
         torch.long = "long"
+    if not hasattr(torch, "inference_mode"):
+        torch.inference_mode = lambda: type("ctx", (), {"__enter__": lambda s: s, "__exit__": lambda s, *a: None})()
 
     # transformers stubs (for 'hf_local' path)
 
@@ -161,9 +163,42 @@ def _install_remote_model_stub_dependencies():
             return cls()
 
     transformers_mod.AutoProcessor = DummyProcessor
+    class DummyTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            return [101, 102, 103]
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+    transformers_mod.AutoTokenizer = DummyTokenizer
     transformers_mod.AutoModelForVision2Seq = DummyModel
     transformers_mod.AutoModelForCausalLM = DummyModel
     sys.modules["transformers"] = transformers_mod
+
+    vllm_mod = types.ModuleType("vllm")
+
+    class DummySamplingParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class DummyGenerateOutput:
+        def __init__(self, text="vllm-direct-output"):
+            self.outputs = [types.SimpleNamespace(text=text)]
+
+    class DummyLLM:
+        def __init__(self, *_args, **_kwargs):
+            self.last_prompts = None
+            self.last_sampling_params = None
+
+        def generate(self, prompts, sampling_params=None, use_tqdm=False):
+            self.last_prompts = prompts
+            self.last_sampling_params = sampling_params
+            return [DummyGenerateOutput()]
+
+    vllm_mod.LLM = DummyLLM
+    vllm_mod.SamplingParams = DummySamplingParams
+    sys.modules["vllm"] = vllm_mod
 
     # PIL stub — only needed if PIL is not installed in the test env
     try:
@@ -462,6 +497,92 @@ class RemoteModelHFLocalTests(unittest.TestCase):
         # fix_json is stubbed as identity, so output passes through unchanged
         out = model._call_hf_local(msgs)
         self.assertEqual(out, "hf-local-output")
+
+
+class RemoteModelVLLMDirectTests(unittest.TestCase):
+    def test_respond_routes_vllm_direct(self):
+        model = RemoteModel("Qwen2.5-VL-7B-Instruct", model_type="vllm_direct", use_easyr1_format=True)
+        model._call_vllm_direct = lambda _msgs: "vllm-direct-output"
+        model._call_qwen7b = lambda _msgs: "wrong-route"
+
+        out = model.respond([{"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+
+        self.assertEqual(out, "vllm-direct-output")
+
+    def test_call_vllm_direct_builds_prompt_token_ids_and_multi_modal_data(self):
+        model = RemoteModel("Qwen2.5-VL-7B-Instruct", model_type="vllm_direct", use_easyr1_format=True)
+
+        captured = {}
+
+        class CaptureTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                captured["prompt_text"] = text
+                captured["add_special_tokens"] = add_special_tokens
+                return [11, 22, 33]
+
+        class CaptureVLLMEngine:
+            def generate(self, prompts, sampling_params=None, use_tqdm=False):
+                captured["prompts"] = prompts
+                captured["sampling_params"] = sampling_params
+                captured["use_tqdm"] = use_tqdm
+                return [types.SimpleNamespace(outputs=[types.SimpleNamespace(text="vllm-direct-output")])]
+
+        model.tokenizer = CaptureTokenizer()
+        model.vllm_engine = CaptureVLLMEngine()
+
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Task: pick up apple.\n"},
+                    {"type": "image_url", "image_url": {"url": _make_1x1_png_data_url()}},
+                    {"type": "text", "text": "\nOutput one action."},
+                ],
+            }
+        ]
+
+        out = model._call_vllm_direct(msgs)
+
+        self.assertEqual(out, "vllm-direct-output")
+        self.assertEqual(captured["prompt_text"], "<|im_start|>user\nTask: pick up apple.\n<|vision_start|><|image_pad|><|vision_end|>\nOutput one action.<|im_end|>\n<|im_start|>assistant\n")
+        self.assertFalse(captured["add_special_tokens"])
+        self.assertEqual(captured["prompts"][0]["prompt_token_ids"], [11, 22, 33])
+        self.assertEqual(len(captured["prompts"][0]["multi_modal_data"]["image"]), 1)
+        self.assertFalse(captured["use_tqdm"])
+
+    def test_call_vllm_direct_accepts_raw_image_items(self):
+        model = RemoteModel("Qwen2.5-VL-7B-Instruct", model_type="vllm_direct", use_easyr1_format=True)
+
+        raw_image = object()
+        captured = {}
+
+        class CaptureTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return [7, 8, 9]
+
+        class CaptureVLLMEngine:
+            def generate(self, prompts, sampling_params=None, use_tqdm=False):
+                captured["prompts"] = prompts
+                return [types.SimpleNamespace(outputs=[types.SimpleNamespace(text="vllm-direct-output")])]
+
+        model.tokenizer = CaptureTokenizer()
+        model.vllm_engine = CaptureVLLMEngine()
+
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Task: pick up apple.\n"},
+                    {"type": "image", "image": raw_image},
+                    {"type": "text", "text": "\nOutput one action."},
+                ],
+            }
+        ]
+
+        out = model._call_vllm_direct(msgs)
+
+        self.assertEqual(out, "vllm-direct-output")
+        self.assertIs(captured["prompts"][0]["multi_modal_data"]["image"][0], raw_image)
 
 
 if __name__ == "__main__":

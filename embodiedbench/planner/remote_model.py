@@ -57,6 +57,19 @@ class RemoteModel:
                     self.model_name, torch_dtype=torch.float16, device_map="auto",
                 )
             self.model.eval()
+        elif self.model_type == 'vllm_direct':
+            from transformers import AutoProcessor, AutoTokenizer
+            from vllm import LLM, SamplingParams
+
+            self.processor = AutoProcessor.from_pretrained(self.model_name)
+            self.tokenizer = getattr(self.processor, "tokenizer", None)
+            if self.tokenizer is None:
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self.vllm_engine = LLM(self.model_name, tensor_parallel_size=tp)
+            self.sampling_params = SamplingParams(
+                temperature=temperature,
+                max_tokens=max_completion_tokens,
+            )
         else:
             if "claude" in self.model_name:
                 self.model = anthropic.Anthropic(
@@ -99,6 +112,8 @@ class RemoteModel:
             return self._call_local(message_history)
         elif self.model_type == 'hf_local':
             return self._call_hf_local(message_history)
+        elif self.model_type == 'vllm_direct':
+            return self._call_vllm_direct(message_history)
         else:
             if "claude" in self.model_name:
                 return self._call_claude(message_history)
@@ -201,12 +216,16 @@ class RemoteModel:
                 continue
             new_content = []
             for item in (content or []):
-                if item.get("type") == "image_url":
+                item_type = item.get("type")
+                if item_type == "image_url":
                     url = item["image_url"]["url"]
                     _, b64_data = url.split(",", 1)
                     image_bytes = base64.b64decode(b64_data)
                     pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
                     pil_images.append(pil_img)
+                    new_content.append({"type": "image"})
+                elif item_type == "image":
+                    pil_images.append(item.get("image"))
                     new_content.append({"type": "image"})
                 else:
                     new_content.append(item)
@@ -303,6 +322,27 @@ class RemoteModel:
 
         generated_ids = output_ids[:, prompt_len:]
         out = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+        if not self.use_easyr1_format:
+            out = fix_json(out)
+        return out
+
+    def _call_vllm_direct(self, message_history: list):
+        """Direct vLLM inference using prompt_token_ids + multi_modal_data."""
+        hf_messages, pil_images = self._extract_images_from_messages(message_history)
+        prompt_text = self._render_hf_local_prompt(hf_messages)
+        prompt_token_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+
+        vllm_input = {"prompt_token_ids": prompt_token_ids}
+        if pil_images:
+            vllm_input["multi_modal_data"] = {"image": pil_images}
+
+        outputs = self.vllm_engine.generate(
+            [vllm_input],
+            sampling_params=self.sampling_params,
+            use_tqdm=False,
+        )
+        out = outputs[0].outputs[0].text
 
         if not self.use_easyr1_format:
             out = fix_json(out)

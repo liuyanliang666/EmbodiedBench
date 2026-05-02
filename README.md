@@ -354,6 +354,22 @@ python -m embodiedbench.main env=eb-hab model_name=OpenGVLab/InternVL2_5-8B exp_
 ```
 You can also refer to [LMDeploy](https://github.com/InternLM/lmdeploy) for more details.
 
+#### **2.5️⃣ Direct vLLM Backend for EasyR1 / DeepEyes Alignment**
+For Qwen-style multimodal models, `model_type=vllm_direct` bypasses the OpenAI-compatible HTTP chat path and sends
+`prompt_token_ids + multi_modal_data` directly into a local vLLM engine. This is useful when you want evaluation to
+match the EasyR1 / DeepEyes inference contract more closely.
+
+```bash
+conda activate embench
+python -m embodiedbench.main env=eb-alf \
+  model_name=Qwen/Qwen2.5-VL-7B-Instruct \
+  model_type=vllm_direct \
+  easyr1_format=true \
+  chat_history=false \
+  exp_name='baseline' \
+  tp=1
+```
+
 
 #### **3️⃣ Online Serving for Unsupported Models**  
 Lmdeploy often lags behind the release of new models. To address this, we offer a more flexible and dynamic model serving approach. Follow these steps to deploy and evaluate new models:
