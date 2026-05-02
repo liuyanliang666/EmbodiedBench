@@ -35,12 +35,12 @@ class VLMPlanner():
             'prompt_template_path',
             os.path.join(os.path.dirname(__file__), 'prompt_templates', 'alfred.jinja')
         )
-        self.topdown_prompt_template_path = self.kwargs.pop(
-            'topdown_prompt_template_path',
-            os.path.join(os.path.dirname(__file__), 'prompt_templates', 'alfred_topdown.jinja')
-        )
+        # The single alfred.jinja template now branches on `images | length` to
+        # cover both first-person-only and first-person + topdown layouts. The
+        # old separate topdown path is kept as a no-op kwarg for back-compat.
+        self.kwargs.pop('topdown_prompt_template_path', None)
         self._prompt_template = None
-        self._topdown_prompt_template = None
+        self._jinja_env = None
         self.easyr1_variant = str(self.kwargs.pop('easyr1_variant', 'default')).strip().lower()
         self.easyr1_navigation_only = (self.easyr1_variant == 'navigation')
         if model_type == 'custom':
@@ -192,37 +192,128 @@ class VLMPlanner():
     @staticmethod
     def _extract_inventory_line(prev_act_feedback):
         """Extract the most recent 'Currently holding' status from feedback history."""
+        held = VLMPlanner._extract_held_object_name(prev_act_feedback)
+        if held is None:
+            return None
+        if held.lower() == 'nothing':
+            return 'You are currently holding nothing in your hand.'
+        return f'You are currently holding: {held}.'
+
+    @staticmethod
+    def _extract_held_object_name(prev_act_feedback):
+        """Return the held-object name from the most recent env feedback, or None.
+
+        Mirrors the field consumed by alfred.jinja's `held_object` placeholder
+        (see EasyR1 generate_summaries_v4.py). Returns 'nothing' when the agent
+        explicitly holds nothing, the bare object name otherwise.
+        """
         if not prev_act_feedback:
             return None
         last_feedback = prev_act_feedback[-1]
         feedback_text = last_feedback[1] if isinstance(last_feedback, (list, tuple)) and len(last_feedback) >= 2 else ''
         if not isinstance(feedback_text, str):
             return None
-        import re
         m = re.search(r'Currently holding: ([^.]+)\.', feedback_text)
         if m:
-            held = m.group(1).strip()
-            if held.lower() == 'nothing':
-                return 'You are currently holding nothing in your hand.'
-            return f'You are currently holding: {held}.'
+            return m.group(1).strip()
         return None
+
+    @staticmethod
+    def _extract_summary_block(output_text):
+        """Pull the full <summary>...</summary> block from a model response.
+
+        Used to feed `prev_summary` into the next step's prompt. The wrapping
+        tags are preserved so the next prompt sees the same structure the
+        model was trained to emit.
+        """
+        if not isinstance(output_text, str):
+            return ""
+        match = re.search(r'<summary>\s*(.*?)\s*</summary>', output_text, flags=re.IGNORECASE | re.DOTALL)
+        if match is None:
+            return ""
+        inner = match.group(1).strip()
+        if not inner:
+            return ""
+        return f"<summary>\n{inner}\n</summary>"
+
+    @staticmethod
+    def _format_action_description(action_dict):
+        """Render an action dict as the human-readable string the v4 trainer used.
+
+        Matches generate_summaries_v4.get_action_description so that the
+        `last_action` field at eval time aligns with the training distribution:
+        list parameters → "ActionType at [x, y]"; string parameters →
+        "ActionType direction"; missing parameter → "ActionType".
+        """
+        if not isinstance(action_dict, dict):
+            return ""
+        action_type = action_dict.get('action_type', '')
+        if not action_type:
+            return ""
+        parameter = action_dict.get('parameter', action_dict.get('action_param'))
+        if isinstance(parameter, list):
+            return f"{action_type} at {parameter}"
+        if isinstance(parameter, str):
+            return f"{action_type} {parameter}"
+        return str(action_type)
+
+    @classmethod
+    def _last_action_from_output(cls, output_text):
+        """Parse the model's <answer> JSON and format it as last_action text."""
+        if not isinstance(output_text, str):
+            return ""
+        answer_text = cls._extract_answer_block(output_text)
+        answer_text = cls._strip_code_fence(answer_text)
+        try:
+            parsed = json.loads(answer_text)
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        if isinstance(parsed, list):
+            if not parsed:
+                return ""
+            parsed = parsed[0]
+        return cls._format_action_description(parsed)
+
+    @staticmethod
+    def _stuck_hint_text():
+        """Hint appended when consecutive observations are pixel-identical."""
+        return (
+            "The previous action was invalid and did not change the scene. "
+            "Before trying again, consider these likely causes: "
+            "the target is not visible from the current viewpoint; "
+            "the target is too far away or out of reach; "
+            "the camera is too close to interact accurately; "
+            "a receptacle or object that must be opened is still closed; "
+            "the path or interaction is blocked; "
+            "a required object is not in hand; "
+            "the agent is already holding the wrong object; "
+            "the selected interaction point is likely inaccurate; "
+            "or the selected interaction, viewpoint, or prerequisite was likely incorrect."
+        )
+
+    def _render_alfred_template(self, template_text, context):
+        """Render alfred.jinja with the given context (jinja2-evaluated)."""
+        if self._jinja_env is None:
+            from jinja2 import Environment
+
+            self._jinja_env = Environment(
+                autoescape=False,
+                trim_blocks=True,
+                lstrip_blocks=False,
+                keep_trailing_newline=False,
+            )
+        return self._jinja_env.from_string(template_text).render(**context)
 
     def _build_easyr1_prompt(self, user_instruction, prev_act_feedback=[]):
         if self.easyr1_navigation_only:
             if self.use_topdown_prompt:
                 return self._build_navigation_topdown_easyr1_prompt(user_instruction)
             return self._build_navigation_easyr1_prompt(user_instruction)
-        if self.use_topdown_prompt:
-            return self._build_topdown_easyr1_prompt(user_instruction, prev_act_feedback)
-
-        task = user_instruction.strip().rstrip('.')
-        template_text = self._load_prompt_template()
-        content = '\n'.join([f'Task: {task}.', '<image>'])
-        prompt = template_text.replace('{{ content | trim }}', content)
-        inventory_line = self._extract_inventory_line(prev_act_feedback)
-        if inventory_line:
-            prompt += f'\n\n{inventory_line}'
-        return prompt
+        return self._build_alfred_easyr1_prompt(
+            user_instruction,
+            prev_act_feedback,
+            with_topdown=self.use_topdown_prompt,
+        )
 
     def _load_prompt_template(self):
         if self._prompt_template is None:
@@ -230,27 +321,53 @@ class VLMPlanner():
                 self._prompt_template = handle.read()
         return self._prompt_template
 
-    def _load_topdown_prompt_template(self):
-        if self._topdown_prompt_template is None:
-            with open(self.topdown_prompt_template_path, 'r', encoding='utf-8') as handle:
-                self._topdown_prompt_template = handle.read()
-        return self._topdown_prompt_template
+    def _build_alfred_easyr1_prompt(self, user_instruction, prev_act_feedback, with_topdown):
+        """Render alfred.jinja with the EasyR1 v4-summary recursion fields.
+
+        Each step receives `held_object`, `last_action`, and `prev_summary` so
+        the model can recurse on its own prior summary, mirroring how the
+        EasyR1 trainer composed its inputs (see generate_summaries_v4.py).
+        """
+        task = user_instruction.strip().rstrip('.')
+        template_text = self._load_prompt_template()
+        if with_topdown:
+            content = '\n'.join([
+                f'Task: {task}.',
+                'Current first-person view:',
+                '<image>',
+                'Reconstructed top-down occupancy map from the trajectory observed so far:',
+                '<image>',
+            ])
+            images_marker = [None, None]
+        else:
+            content = '\n'.join([f'Task: {task}.', '<image>'])
+            images_marker = [None]
+
+        held_object = self._extract_held_object_name(prev_act_feedback) or 'nothing'
+        last_action = self.prev_action_desc or 'none (first step)'
+        prev_summary = self.prev_summary or '(none, first step)'
+
+        prompt = self._render_alfred_template(
+            template_text,
+            {
+                'content': content,
+                'held_object': held_object,
+                'last_action': last_action,
+                'prev_summary': prev_summary,
+                'images': images_marker,
+            },
+        )
+
+        if self.frames_unchanged_hint:
+            prompt = f"{prompt}\n\n{self.frames_unchanged_hint}"
+
+        return prompt
 
     def _build_topdown_easyr1_prompt(self, user_instruction, prev_act_feedback=[]):
-        task = user_instruction.strip().rstrip('.')
-        template_text = self._load_topdown_prompt_template()
-        content = '\n'.join([
-            f'Task: {task}.',
-            'Current first-person view:',
-            '<image>',
-            'Reconstructed top-down occupancy map from the trajectory observed so far:',
-            '<image>',
-        ])
-        prompt = template_text.replace('{{ content | trim }}', content)
-        inventory_line = self._extract_inventory_line(prev_act_feedback)
-        if inventory_line:
-            prompt += f'\n\n{inventory_line}'
-        return prompt
+        # Retained for back-compat; delegate to the unified alfred renderer.
+        return self._build_alfred_easyr1_prompt(
+            user_instruction, prev_act_feedback, with_topdown=True
+        )
 
     def _build_navigation_easyr1_prompt(self, user_instruction):
         task = user_instruction.strip().rstrip('.')
@@ -908,6 +1025,12 @@ class VLMPlanner():
         self.steps_since_memory_refresh = 0
         self.planner_steps = 0
         self.output_json_error = 0
+        # EasyR1 v4-summary recursion state. Cleared every episode so prompts
+        # for step 0 fall back to the "(none, first step)" / "none (first step)"
+        # defaults declared in alfred.jinja.
+        self.prev_summary = ""
+        self.prev_action_desc = ""
+        self.frames_unchanged_hint = ""
 
     def language_to_action(self, output_text):
         pattern = r'\*\*\d+\*\*'
@@ -980,6 +1103,23 @@ class VLMPlanner():
 
     
         
+    def _update_summary_state(self, output_text):
+        """Capture the model's <summary> block and last-action description.
+
+        Skipped for the navigation-only easyr1 variant whose template lacks a
+        summary section. For the alfred summary template these fields feed
+        back into the next step's prompt so the model recurses on its own
+        prior progress/spatial summary, matching the EasyR1 v4 setup.
+        """
+        if not self.use_easyr1_format or self.easyr1_navigation_only:
+            return
+        new_summary = self._extract_summary_block(output_text)
+        if new_summary:
+            self.prev_summary = new_summary
+        new_action_desc = self._last_action_from_output(output_text)
+        if new_action_desc:
+            self.prev_action_desc = new_action_desc
+
     def act_custom(self, prompt, obs):
         out = self.model.respond(prompt, self._get_custom_model_observation(obs))
         print(f"Model Output:\n{out}\n")
@@ -988,6 +1128,7 @@ class VLMPlanner():
             out = fix_json(out)
         logger.debug(f"Model Output:\n{out}\n")
         action = self.json_to_action(out)
+        self._update_summary_state(out)
         self.planner_steps += 1
         return action, out
 
@@ -1055,11 +1196,21 @@ class VLMPlanner():
                 }
             )
         action = self.json_to_action(out)
+        self._update_summary_state(out)
         self.planner_steps += 1
         return action, out
 
     def update_info(self, info, previous_obs=None, current_obs=None):
         """Update episode feedback history."""
+        # Update the stuck-frame hint regardless of mode; it's only consumed by
+        # the alfred summary template, but tracking it here keeps reset/update
+        # paths consistent and makes the behaviour testable in isolation.
+        if previous_obs is not None and current_obs is not None and \
+                self._observations_are_unchanged(previous_obs, current_obs):
+            self.frames_unchanged_hint = self._stuck_hint_text()
+        else:
+            self.frames_unchanged_hint = ""
+
         if self.memory_compression:
             self.steps_since_memory_refresh += 1
             if self.steps_since_memory_refresh >= self.segment_len:

@@ -99,12 +99,19 @@ class AlfredTopdownPlannerTests(unittest.TestCase):
         prompt = planner.process_prompt("Find a mug.")
 
         self.assertIn(
-            "Given the current first-person photo and the task below, your goal is to predict the next optimal discrete action.",
+            "Given the current first-person photo, your history summary, and the task below, your goal is to predict the next optimal discrete action and report the current history summary.",
             prompt,
         )
         self.assertIn("Task: Find a mug.\n<image>", prompt)
         self.assertNotIn("Current first-person view:", prompt)
-        self.assertNotIn("The second image is a reconstructed top-down occupancy map", prompt)
+        self.assertNotIn("the reconstructed top-down occupancy map", prompt)
+        self.assertNotIn("top-down arrow", prompt)
+        self.assertIn("Held object: nothing", prompt)
+        self.assertIn("Last action: none (first step)", prompt)
+        self.assertIn("History summary:\n(none, first step)", prompt)
+        self.assertIn("<summary>", prompt)
+        self.assertIn("<progress>", prompt)
+        self.assertIn("<spatial>", prompt)
 
     def test_topdown_prompt_uses_local_template(self):
         planner = VLMPlanner(
@@ -120,11 +127,21 @@ class AlfredTopdownPlannerTests(unittest.TestCase):
         prompt = planner.process_prompt("Find a mug.")
 
         self.assertTrue(planner.use_easyr1_format)
+        self.assertIn(
+            "Given the current first-person photo",
+            prompt,
+        )
+        self.assertIn("the reconstructed top-down occupancy map", prompt)
+        self.assertIn("your history summary, and the task below", prompt)
         self.assertIn("The first image is the current first-person photo.", prompt)
         self.assertIn("The second image is a reconstructed top-down occupancy map", prompt)
         self.assertIn("Task: Find a mug", prompt)
         self.assertIn("Current first-person view:\n<image>", prompt)
         self.assertIn("Reconstructed top-down occupancy map from the trajectory observed so far:\n<image>", prompt)
+        self.assertIn("top-down arrow", prompt)
+        self.assertIn("Held object: nothing", prompt)
+        self.assertIn("Last action: none (first step)", prompt)
+        self.assertIn("History summary:\n(none, first step)", prompt)
 
     def test_navigation_topdown_prompt_uses_navigation_only_template(self):
         planner = VLMPlanner(
@@ -267,6 +284,171 @@ class AlfredTopdownPlannerTests(unittest.TestCase):
 
         self.assertEqual(action, "MoveAhead")
         self.assertEqual(captured["obs"], ["/tmp/head.png", "/tmp/topdown.png"])
+
+
+class AlfredSummaryRecursionTests(unittest.TestCase):
+    """Cover the EasyR1 v4-summary fields injected into alfred.jinja."""
+
+    def _make_planner(self, use_topdown_prompt=False):
+        return VLMPlanner(
+            "dummy-model",
+            "custom",
+            actions=["MoveAhead"],
+            system_prompt="",
+            examples=[],
+            use_easyr1_format=True,
+            use_topdown_prompt=use_topdown_prompt,
+        )
+
+    def test_held_object_extracted_from_recent_feedback(self):
+        planner = self._make_planner()
+        feedback = [[None, "Action executed. Currently holding: Apple. Other info.", 1.0]]
+        prompt = planner.process_prompt("Find a mug.", prev_act_feedback=feedback)
+        self.assertIn("Held object: Apple", prompt)
+        self.assertNotIn("Held object: nothing", prompt)
+
+    def test_held_object_explicit_nothing_propagates(self):
+        planner = self._make_planner()
+        feedback = [[None, "Currently holding: nothing.", 1.0]]
+        prompt = planner.process_prompt("Find a mug.", prev_act_feedback=feedback)
+        self.assertIn("Held object: nothing", prompt)
+
+    def test_last_action_uses_v4_format_after_act(self):
+        planner = self._make_planner()
+
+        def fake_respond(prompt, obs=None):
+            return (
+                "<summary>\n"
+                "<progress>\nProgressing.\n</progress>\n"
+                "<spatial>\nLayout note.\n</spatial>\n"
+                "</summary>\n"
+                "<think> reasoning </think>\n"
+                '<answer> [{"action_type": "PickupObject", "parameter": [305, 295]}] </answer>'
+            )
+
+        planner.model.respond = fake_respond
+        planner.act("/tmp/head.png", "Pick the apple")
+
+        prompt = planner.process_prompt("Pick the apple", prev_act_feedback=[])
+        self.assertIn("Last action: PickupObject at [305, 295]", prompt)
+
+    def test_prev_summary_is_recursed_into_next_prompt(self):
+        planner = self._make_planner()
+
+        def fake_respond(prompt, obs=None):
+            return (
+                "<summary>\n"
+                "<progress>\nI have located the apple.\n</progress>\n"
+                "<spatial>\nThe apple sits on the counter at front-right.\n</spatial>\n"
+                "</summary>\n"
+                "<think> ... </think>\n"
+                '<answer> [{"action_type": "Move", "parameter": "forward"}] </answer>'
+            )
+
+        planner.model.respond = fake_respond
+        planner.act("/tmp/head.png", "Pick the apple")
+
+        prompt = planner.process_prompt("Pick the apple", prev_act_feedback=[])
+        self.assertIn("History summary:\n<summary>", prompt)
+        self.assertIn("I have located the apple.", prompt)
+        self.assertIn("The apple sits on the counter at front-right.", prompt)
+        self.assertNotIn("(none, first step)", prompt)
+
+    def test_first_step_defaults_when_no_prior_state(self):
+        planner = self._make_planner()
+        prompt = planner.process_prompt("Find a mug.", prev_act_feedback=[])
+        self.assertIn("Held object: nothing", prompt)
+        self.assertIn("Last action: none (first step)", prompt)
+        self.assertIn("History summary:\n(none, first step)", prompt)
+        self.assertNotIn("previous action was invalid and did not change the scene", prompt)
+
+    def test_stuck_hint_appended_when_frames_unchanged(self):
+        planner = self._make_planner()
+        same_obs = [[1, 2], [3, 4]]
+        planner.update_info(
+            {"env_feedback": "Currently holding: nothing.", "action_id": 0},
+            previous_obs=same_obs,
+            current_obs=same_obs,
+        )
+        prompt = planner.process_prompt("Find a mug.", prev_act_feedback=planner.episode_act_feedback)
+        self.assertIn("previous action was invalid and did not change the scene", prompt)
+        # Hint must come AFTER the rendered template, not in the middle.
+        self.assertTrue(
+            prompt.rstrip().endswith("viewpoint, or prerequisite was likely incorrect."),
+            "Stuck hint should be appended at the end of the prompt.",
+        )
+
+    def test_stuck_hint_clears_when_frames_change(self):
+        planner = self._make_planner()
+        # First update flips it on.
+        same_obs = [[1, 2], [3, 4]]
+        planner.update_info(
+            {"env_feedback": "Currently holding: nothing.", "action_id": 0},
+            previous_obs=same_obs,
+            current_obs=same_obs,
+        )
+        self.assertTrue(planner.frames_unchanged_hint)
+        # Second update with different obs should clear it.
+        planner.update_info(
+            {"env_feedback": "Currently holding: nothing.", "action_id": 0},
+            previous_obs=[[1, 2], [3, 4]],
+            current_obs=[[9, 9], [9, 9]],
+        )
+        prompt = planner.process_prompt("Find a mug.", prev_act_feedback=planner.episode_act_feedback)
+        self.assertNotIn("previous action was invalid and did not change the scene", prompt)
+
+    def test_format_action_description_matches_v4_helper(self):
+        # Mirrors generate_summaries_v4.get_action_description so eval-time
+        # last_action strings stay in distribution with training.
+        self.assertEqual(
+            VLMPlanner._format_action_description(
+                {"action_type": "PickupObject", "parameter": [305, 295]}
+            ),
+            "PickupObject at [305, 295]",
+        )
+        self.assertEqual(
+            VLMPlanner._format_action_description({"action_type": "Move", "parameter": "forward"}),
+            "Move forward",
+        )
+        self.assertEqual(
+            VLMPlanner._format_action_description({"action_type": "Look"}),
+            "Look",
+        )
+
+    def test_extract_summary_block_preserves_tags(self):
+        out = (
+            "<summary>\n"
+            "<progress>\nSeen the apple.\n</progress>\n"
+            "<spatial>\nApple on the counter.\n</spatial>\n"
+            "</summary>\n"
+            "<think>...</think><answer>x</answer>"
+        )
+        block = VLMPlanner._extract_summary_block(out)
+        self.assertTrue(block.startswith("<summary>"))
+        self.assertTrue(block.endswith("</summary>"))
+        self.assertIn("Seen the apple.", block)
+
+    def test_topdown_prompt_renders_summary_recursion_fields(self):
+        planner = self._make_planner(use_topdown_prompt=True)
+
+        def fake_respond(prompt, obs=None):
+            return (
+                "<summary>\n"
+                "<progress>\nI just rotated.\n</progress>\n"
+                "<spatial>\nKitchen on my left.\n</spatial>\n"
+                "</summary>\n"
+                "<think>...</think>\n"
+                '<answer> [{"action_type": "Rotate", "parameter": "left"}] </answer>'
+            )
+
+        planner.model.respond = fake_respond
+        planner.act({"head_rgb": "/tmp/h.png", "topdown_rgb": "/tmp/t.png"}, "Find a mug")
+
+        prompt = planner.process_prompt("Find a mug", prev_act_feedback=[])
+        self.assertIn("Last action: Rotate left", prompt)
+        self.assertIn("I just rotated.", prompt)
+        self.assertIn("Kitchen on my left.", prompt)
+        self.assertIn("the reconstructed top-down occupancy map", prompt)
 
 
 if __name__ == "__main__":
