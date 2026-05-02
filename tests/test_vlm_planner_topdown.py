@@ -102,7 +102,7 @@ class AlfredTopdownPlannerTests(unittest.TestCase):
             "Given the current first-person photo, your history summary, and the task below, your goal is to predict the next optimal discrete action and report the current history summary.",
             prompt,
         )
-        self.assertIn("Task: Find a mug.\n<image>", prompt)
+        self.assertIn("Task: Find a mug\n<image>", prompt)
         self.assertNotIn("Current first-person view:", prompt)
         self.assertNotIn("the reconstructed top-down occupancy map", prompt)
         self.assertNotIn("top-down arrow", prompt)
@@ -304,8 +304,18 @@ class AlfredSummaryRecursionTests(unittest.TestCase):
         planner = self._make_planner()
         feedback = [[None, "Action executed. Currently holding: Apple. Other info.", 1.0]]
         prompt = planner.process_prompt("Find a mug.", prev_act_feedback=feedback)
-        self.assertIn("Held object: Apple", prompt)
+        # Training data sources held_object from PDDL args (lowercase like
+        # "apple"), so we lowercase the THOR PascalCase objectType on the way
+        # into the prompt to keep eval-time inputs in distribution.
+        self.assertIn("Held object: apple", prompt)
+        self.assertNotIn("Held object: Apple", prompt)
         self.assertNotIn("Held object: nothing", prompt)
+
+    def test_held_object_lowercases_compound_thor_name(self):
+        planner = self._make_planner()
+        feedback = [[None, "Currently holding: FloorLamp.", 1.0]]
+        prompt = planner.process_prompt("Find a mug.", prev_act_feedback=feedback)
+        self.assertIn("Held object: floorlamp", prompt)
 
     def test_held_object_explicit_nothing_propagates(self):
         planner = self._make_planner()

@@ -215,7 +215,14 @@ class VLMPlanner():
             return None
         m = re.search(r'Currently holding: ([^.]+)\.', feedback_text)
         if m:
-            return m.group(1).strip()
+            held = m.group(1).strip()
+            # Training data sources held_object from ALFRED PDDL discrete_action
+            # args, which are lowercase (e.g. "apple", "floorlamp"). The env
+            # feedback uses THOR's PascalCase objectType ("Apple", "FloorLamp").
+            # Lowercase to match the training distribution.
+            if held.lower() == 'nothing':
+                return 'nothing'
+            return held.lower()
         return None
 
     @staticmethod
@@ -330,9 +337,11 @@ class VLMPlanner():
         """
         task = user_instruction.strip().rstrip('.')
         template_text = self._load_prompt_template()
+        # Match the exact `Task:` line built by EasyR1's
+        # convert_alfred_to_dataset.build_prompt (no trailing period).
         if with_topdown:
             content = '\n'.join([
-                f'Task: {task}.',
+                f'Task: {task}',
                 'Current first-person view:',
                 '<image>',
                 'Reconstructed top-down occupancy map from the trajectory observed so far:',
@@ -340,7 +349,7 @@ class VLMPlanner():
             ])
             images_marker = [None, None]
         else:
-            content = '\n'.join([f'Task: {task}.', '<image>'])
+            content = '\n'.join([f'Task: {task}', '<image>'])
             images_marker = [None]
 
         held_object = self._extract_held_object_name(prev_act_feedback) or 'nothing'
