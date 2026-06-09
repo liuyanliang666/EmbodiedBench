@@ -106,7 +106,8 @@ class EBAlfEnv(gym.Env):
         action_space (gym.spaces.Discrete): Discrete action space 
         language_skill_set (list): Readable action descriptions
     """
-    def __init__(self, eval_set='base', exp_name='', down_sample_ratio=1.0, selected_indexes=[], detection_box=False, resolution=600):
+    def __init__(self, eval_set='base', exp_name='', down_sample_ratio=1.0, selected_indexes=[], detection_box=False, resolution=600, max_episode_steps=30, max_invalid_actions=10,
+                 topdown_camera_y_offset=0.675, topdown_min_height=0.1, topdown_max_height=2.0):
         """
         Initialize the AI2THOR environment.
         """
@@ -130,9 +131,9 @@ class EBAlfEnv(gym.Env):
         self.selected_indexes = selected_indexes
         self._initial_episode_num = 0
         self._current_step = 0
-        self._max_episode_steps = 30
+        self._max_episode_steps = max_episode_steps
         self._cur_invalid_actions = 0
-        self._max_invalid_actions = 10
+        self._max_invalid_actions = max_invalid_actions
         self._episode_start_time = 0
         self.episode_log = []
         
@@ -153,6 +154,11 @@ class EBAlfEnv(gym.Env):
         self.id_to_name_dict = None
         self.topdown_builder = None
         self.latest_topdown_rgb = None
+        # Topdown reconstruction params (aligned with EasyR1's
+        # --topdown-camera-y-offset / --topdown-min-height / --topdown-max-height).
+        self.topdown_camera_y_offset = float(topdown_camera_y_offset)
+        self.topdown_min_height = float(topdown_min_height)
+        self.topdown_max_height = float(topdown_max_height)
         self.language_skill_set = get_global_action_space()
         self.action_space = gym.spaces.Discrete(len(self.language_skill_set))
 
@@ -376,7 +382,12 @@ class EBAlfEnv(gym.Env):
             )
 
         return AlfredTopdownBuilder(
-            AlfredTopdownConfig(output_size=(self.resolution, self.resolution)),
+            AlfredTopdownConfig(
+                output_size=(self.resolution, self.resolution),
+                camera_y_offset=self.topdown_camera_y_offset,
+                min_height=self.topdown_min_height,
+                max_height=self.topdown_max_height,
+            ),
             initial_bounds=initial_bounds,
         )
 

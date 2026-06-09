@@ -18,7 +18,15 @@ exp_name: null
 visual_icl: null
 tp: null
 easyr1_format: null
+prompt_template_path: null
+point_input_resolution: null
+point_output_resolution: null
 env_feedback: null
 memory_compression: null
 segment_len: null
 log_level: null
+max_episode_steps: null
+max_invalid_actions: null
+topdown_camera_y_offset: null
+topdown_min_height: null
+topdown_max_height: null

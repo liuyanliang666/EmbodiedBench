@@ -63,10 +63,15 @@ class EB_AlfredEvaluator():
             self.eval_set = eval_set
             logger.info(f'Current eval set: {eval_set}')
             exp_name = f"{self.model_name.split('/')[-1]}_{self.config['exp_name']}/{eval_set}" if len(self.config['exp_name']) else f"{self.model_name.split('/')[-1]}/{eval_set}"
-            self.env = EBAlfEnv(eval_set=self.eval_set, down_sample_ratio=self.config['down_sample_ratio'], 
-                                          exp_name=exp_name, selected_indexes=self.config.get('selected_indexes', []), 
+            self.env = EBAlfEnv(eval_set=self.eval_set, down_sample_ratio=self.config['down_sample_ratio'],
+                                          exp_name=exp_name, selected_indexes=self.config.get('selected_indexes', []),
                                           detection_box=self.config.get('detection_box', False),
-                                          resolution=self.config.get('resolution', 600), 
+                                          resolution=self.config.get('resolution', 600),
+                                          max_episode_steps=self.config.get('max_episode_steps', 30),
+                                          max_invalid_actions=self.config.get('max_invalid_actions', 10),
+                                          topdown_camera_y_offset=self.config.get('topdown_camera_y_offset', 0.675),
+                                          topdown_min_height=self.config.get('topdown_min_height', 0.1),
+                                          topdown_max_height=self.config.get('topdown_max_height', 2.0),
                                           )
             examples = json.load(open(example_path, 'r+')) if self.eval_set != 'long_horizon' else json.load(open(exploration_example_path, 'r+'))
             model_type = self.config.get('model_type', 'remote')
@@ -76,6 +81,16 @@ class EB_AlfredEvaluator():
                 use_easyr1_format = (model_type == 'custom' or 'easyr1' in self.model_name.lower())
             if use_topdown_prompt:
                 use_easyr1_format = True
+            planner_kwargs = {'image_resolution': self.config.get('resolution', 600)}
+            prompt_template_path = self.config.get('prompt_template_path')
+            if prompt_template_path:
+                planner_kwargs['prompt_template_path'] = prompt_template_path
+            point_input_resolution = self.config.get('point_input_resolution')
+            if point_input_resolution is not None:
+                planner_kwargs['point_input_resolution'] = point_input_resolution
+            point_output_resolution = self.config.get('point_output_resolution')
+            if point_output_resolution is not None:
+                planner_kwargs['point_output_resolution'] = point_output_resolution
             self.planner = VLMPlanner(self.model_name, model_type, self.env.language_skill_set, system_prompt, examples, n_shot=self.config['n_shots'], 
                                             obs_key='head_rgb', chat_history=self.config['chat_history'], language_only=self.config['language_only'],
                                             use_feedback=self.config.get('env_feedback', True), multistep=self.config.get('multistep', 0), tp=self.config.get('tp', 1),
@@ -83,7 +98,7 @@ class EB_AlfredEvaluator():
                                             segment_len=self.config.get('segment_len', 1),
                                             enable_point_actions=True, use_easyr1_format=use_easyr1_format,
                                             use_topdown_prompt=use_topdown_prompt,
-                                            kwargs={'image_resolution': self.config.get('resolution', 600)})
+                                            kwargs=planner_kwargs)
 
             self.evaluate()
             average_json_values(os.path.join(self.env.log_path, 'results'), output_file='summary.json')
@@ -214,7 +229,13 @@ if __name__ == '__main__':
         parser.add_argument('--env_feedback', type=int, help='Set to True to enable environment feedback.')
         parser.add_argument('--tp', type=int, help='number of tensor parallel splits of the model parameters')
         parser.add_argument('--easyr1_format', type=int, help='Set to True to use EasyR1 <think>/<answer> JSON action format.')
+        parser.add_argument('--prompt_template_path', type=str, help='Path to a Jinja prompt template used by the EasyR1 ALFRED prompt renderer.')
+        parser.add_argument('--point_input_resolution', type=int, help='Coordinate resolution expected from model-emitted interaction points.')
+        parser.add_argument('--point_output_resolution', type=int, help='Coordinate resolution used for executed interaction points.')
         parser.add_argument('--use_topdown_prompt', type=int, help='Set to True to use the local EasyR1-style ALFRED topdown prompt with head_rgb and topdown_rgb.')
+        parser.add_argument('--topdown_camera_y_offset', type=float, help='Meters added to THOR agent.position.y for the topdown camera height. Mirrors EasyR1 --topdown-camera-y-offset (default 0.675).')
+        parser.add_argument('--topdown_min_height', type=float, help='Lower bound (m) on world Z for topdown occupancy points. Mirrors EasyR1 --topdown-min-height (default 0.1).')
+        parser.add_argument('--topdown_max_height', type=float, help='Upper bound (m) on world Z for topdown occupancy points. Mirrors EasyR1 --topdown-max-height (default 2.0).')
         parser.add_argument('--memory_compression', type=int, help='Set to True to enable compressed memory replanning.')
         parser.add_argument('--segment_len', type=int, help='Number of executed environment actions per memory refresh.')
         return parser.parse_args()
@@ -236,7 +257,13 @@ if __name__ == '__main__':
         'env_feedback': 1,
         'tp': 1,
         'easyr1_format': None,
+        'prompt_template_path': None,
+        'point_input_resolution': None,
+        'point_output_resolution': None,
         'use_topdown_prompt': 0,
+        'topdown_camera_y_offset': 0.675,
+        'topdown_min_height': 0.1,
+        'topdown_max_height': 2.0,
         'memory_compression': 0,
         'segment_len': 1,
     }

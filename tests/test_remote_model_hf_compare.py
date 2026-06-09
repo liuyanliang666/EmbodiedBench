@@ -188,6 +188,7 @@ def _install_remote_model_stub_dependencies():
 
     class DummyLLM:
         def __init__(self, *_args, **_kwargs):
+            self.init_kwargs = dict(_kwargs)
             self.last_prompts = None
             self.last_sampling_params = None
 
@@ -202,8 +203,10 @@ def _install_remote_model_stub_dependencies():
 
     # PIL stub — only needed if PIL is not installed in the test env
     try:
-        from PIL import Image as _  # noqa: F401
+        from PIL import Image as _pil_image  # noqa: F401
     except ImportError:
+        _pil_image = None
+    if not hasattr(_pil_image, "open"):
         pil_mod = types.ModuleType("PIL")
         pil_image_mod = types.ModuleType("PIL.Image")
 
@@ -500,6 +503,14 @@ class RemoteModelHFLocalTests(unittest.TestCase):
 
 
 class RemoteModelVLLMDirectTests(unittest.TestCase):
+    def test_vllm_direct_initializes_with_two_image_limit(self):
+        model = RemoteModel("Qwen2.5-VL-7B-Instruct", model_type="vllm_direct", use_easyr1_format=True)
+
+        self.assertEqual(
+            model.vllm_engine.init_kwargs["limit_mm_per_prompt"],
+            {"image": 2, "video": 0},
+        )
+
     def test_respond_routes_vllm_direct(self):
         model = RemoteModel("Qwen2.5-VL-7B-Instruct", model_type="vllm_direct", use_easyr1_format=True)
         model._call_vllm_direct = lambda _msgs: "vllm-direct-output"

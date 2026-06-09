@@ -7,8 +7,6 @@ import anthropic
 import google.generativeai as genai
 from openai import OpenAI
 import typing_extensions as typing
-import lmdeploy
-from lmdeploy import pipeline, GenerationConfig, PytorchEngineConfig
 from PIL import Image
 from embodiedbench.planner.planner_config.generation_guide import llm_generation_guide, vlm_generation_guide
 from embodiedbench.planner.planner_config.generation_guide_manip import llm_generation_guide_manip, vlm_generation_guide_manip
@@ -24,6 +22,13 @@ _DEFAULT_SYSTEM_PROMPT_PREFIXES = (
     "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n",
 )
 _QWEN_VISION_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
+
+
+def _load_lmdeploy_components():
+    from lmdeploy import pipeline, GenerationConfig, PytorchEngineConfig
+
+    return pipeline, GenerationConfig, PytorchEngineConfig
+
 
 class RemoteModel:
     def __init__(
@@ -42,6 +47,8 @@ class RemoteModel:
         self.use_easyr1_format = use_easyr1_format
 
         if self.model_type == 'local':
+            pipeline, GenerationConfig, PytorchEngineConfig = _load_lmdeploy_components()
+            self._lmdeploy_generation_config = GenerationConfig
             backend_config = PytorchEngineConfig(session_len=12000, dtype='float16', tp=tp)
             self.model = pipeline(self.model_name, backend_config=backend_config)
         elif self.model_type == 'hf_local':
@@ -65,7 +72,11 @@ class RemoteModel:
             self.tokenizer = getattr(self.processor, "tokenizer", None)
             if self.tokenizer is None:
                 self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-            self.vllm_engine = LLM(self.model_name, tensor_parallel_size=tp)
+            self.vllm_engine = LLM(
+                self.model_name,
+                tensor_parallel_size=tp,
+                limit_mm_per_prompt={"image": 2, "video": 0},
+            )
             self.sampling_params = SamplingParams(
                 temperature=temperature,
                 max_tokens=max_completion_tokens,
@@ -156,6 +167,11 @@ class RemoteModel:
         return response.choices[0].message.content
 
     def _call_local(self, message_history: list):
+        GenerationConfig = getattr(self, "_lmdeploy_generation_config", None)
+        if GenerationConfig is None:
+            _, GenerationConfig, _ = _load_lmdeploy_components()
+            self._lmdeploy_generation_config = GenerationConfig
+
         if self.use_easyr1_format:
             response = self.model(
                 message_history,

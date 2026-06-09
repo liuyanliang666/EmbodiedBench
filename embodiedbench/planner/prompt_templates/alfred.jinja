@@ -23,7 +23,6 @@ You must output exactly ONE next action per turn (array length must be 1). Do no
 Navigation Actions (Moving and adjusting view):
 For these actions, the 'parameter' is a string indicating the direction.
 - Moves the robot forward by 25cm: [{"action_type": "Move", "parameter": "forward"}]
-- Moves the robot backward by 25cm: [{"action_type": "Move", "parameter": "backward"}]
 - Rotates the robot's perspective 90 degrees to the right: [{"action_type": "Rotate", "parameter": "right"}]
 - Rotates the robot's perspective 90 degrees to the left: [{"action_type": "Rotate", "parameter": "left"}]
 - Tilts the camera up by 15 degrees to inspect higher areas: [{"action_type": "Look", "parameter": "up"}]
@@ -32,12 +31,12 @@ For these actions, the 'parameter' is a string indicating the direction.
 Interaction Actions (Manipulating objects):
 For these actions, the 'action_type' is the specific action name, and you MUST provide a 2D array [x, y] as the 'parameter'. The [x, y] represents the pixel coordinates of the target object in the 600x600 first-person image (where (0, 0) is the top-left corner, x is horizontal width, y is vertical height).
 - Pick up a target object: [{"action_type": "PickupObject", "parameter": [x, y]}]
-- Put down an object currently held: [{"action_type": "PutObject", "parameter": [x, y]}]
-- Open an object (e.g., cabinet, drawer, fridge): [{"action_type": "OpenObject", "parameter": [x, y]}]
-- Close an object: [{"action_type": "CloseObject", "parameter": [x, y]}]
-- Turn on an appliance or light: [{"action_type": "ToggleObjectOn", "parameter": [x, y]}]
-- Turn off an appliance or light: [{"action_type": "ToggleObjectOff", "parameter": [x, y]}]
-- Slice an object (e.g., apple, bread) with a knife: [{"action_type": "SliceObject", "parameter": [x, y]}]
+- Put the object currently in hand into/on a target receptacle or surface. Use PutObject only when Held object is not nothing. The [x, y] must point to the receptacle/surface, not the held object or empty space. If placing into a container, the container must be open first: [{"action_type": "PutObject", "parameter": [x, y]}]
+- Open a visible openable object that is currently closed (e.g., cabinet, drawer, fridge). The [x, y] must point to the object itself or its handle/door/front: [{"action_type": "OpenObject", "parameter": [x, y]}]
+- Close a visible openable object that is currently open (e.g., cabinet, drawer, fridge). The [x, y] must point to the object itself or its handle/door/front: [{"action_type": "CloseObject", "parameter": [x, y]}]
+- Turn on an appliance or light by pointing to its switch or control: [{"action_type": "ToggleObjectOn", "parameter": [x, y]}]
+- Turn off an appliance or light by pointing to its switch or control: [{"action_type": "ToggleObjectOff", "parameter": [x, y]}]
+- Slice a sliceable object (e.g., apple, bread). Use SliceObject only when Held object is a Knife. The [x, y] must point to the object to slice, not the knife: [{"action_type": "SliceObject", "parameter": [x, y]}]
 
 Output format:
 First, output a history summary up to the current observation in <summary> </summary> tags. The summary should contain:
@@ -78,10 +77,10 @@ A blank hallway wall blocks forward travel at close range. Through the doorway o
 With the tomato in my hand and the fridge already open, I only need to place the tomato inside to finish.
 </progress>
 <spatial>
-The open fridge is directly ahead at close range, with an empty gap on the middle shelf at eye level. Nothing blocks the approach, and the top-down arrow faces the fridge.
+The open fridge is directly ahead at close range, with a visible open fridge receptacle region on the middle shelf at eye level. Nothing blocks the approach, and the top-down arrow faces the fridge.
 </spatial>
 </summary>
-<think> The fridge is already open, so I can set the tomato down on the empty middle shelf. The gap centers around [305, 295], well inside the opening. </think>
+<think> The fridge is already open, so I can set the tomato down inside it. The PutObject point should target the open fridge receptacle region around [305, 295], not empty space outside the receptacle. </think>
 <answer> [{"action_type": "PutObject", "parameter": [305, 295]}] </answer>
 
 <summary>

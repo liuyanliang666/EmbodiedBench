@@ -35,6 +35,18 @@ class VLMPlanner():
             'prompt_template_path',
             os.path.join(os.path.dirname(__file__), 'prompt_templates', 'alfred.jinja')
         )
+        self.point_output_resolution = self._coerce_positive_int(
+            self.kwargs.pop('point_output_resolution', None),
+            self.image_resolution,
+        )
+        point_input_resolution = self.kwargs.pop('point_input_resolution', None)
+        if point_input_resolution is None:
+            template_name = os.path.basename(str(self.prompt_template_path)).lower()
+            point_input_resolution = 1000 if 'qwen3' in template_name else self.image_resolution
+        self.point_input_resolution = self._coerce_positive_int(
+            point_input_resolution,
+            self.image_resolution,
+        )
         # The single alfred.jinja template now branches on `images | length` to
         # cover both first-person-only and first-person + topdown layouts. The
         # old separate topdown path is kept as a no-op kwarg for back-compat.
@@ -539,7 +551,17 @@ class VLMPlanner():
         return match.group(1).strip() if match else text.strip()
 
     @staticmethod
-    def _normalize_easyr1_point(point):
+    def _coerce_positive_int(value, default):
+        if value is None:
+            return int(default)
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return int(default)
+        return value if value > 0 else int(default)
+
+    @staticmethod
+    def _coerce_easyr1_point(point):
         if not isinstance(point, (list, tuple)) or len(point) != 2:
             return None
         try:
@@ -548,6 +570,19 @@ class VLMPlanner():
         except (TypeError, ValueError):
             return None
         return [x, y]
+
+    def _normalize_easyr1_point(self, point, scale=False):
+        point = self._coerce_easyr1_point(point)
+        if point is None or not scale:
+            return point
+        if self.point_input_resolution == self.point_output_resolution:
+            return point
+
+        max_coord = self.point_output_resolution - 1
+        return [
+            min(max(int(round(point[0] * self.point_output_resolution / self.point_input_resolution)), 0), max_coord),
+            min(max(int(round(point[1] * self.point_output_resolution / self.point_input_resolution)), 0), max_coord),
+        ]
 
     def _to_easyr1_answer(self, action_type, parameter):
         return json.dumps([{"action_type": action_type, "parameter": parameter}], ensure_ascii=False)
@@ -762,17 +797,29 @@ class VLMPlanner():
         if action_key in ('move', 'rotate', 'look'):
             if not isinstance(parameter, str):
                 return -1
+            if (
+                not self.easyr1_navigation_only
+                and action_key == 'move'
+                and parameter.strip().lower() == 'backward'
+            ):
+                return -1
             nav_action = self._EASYR1_JSON_NAV_MAP.get((action_key, parameter.strip().lower()))
             return nav_action if nav_action is not None else -1
 
         if action_key in self._EASYR1_JSON_INTER_MAP:
-            point = self._normalize_easyr1_point(parameter)
+            point = self._normalize_easyr1_point(parameter, scale=True)
             if point is None:
                 return -1
             return {"action": self._EASYR1_JSON_INTER_MAP[action_key], "point": point}
 
         if action_type in self._EASYR1_NAV_ACTIONS:
             nav_type, nav_param = self._EASYR1_NAV_ACTIONS[action_type]
+            if (
+                not self.easyr1_navigation_only
+                and nav_type.lower() == 'move'
+                and nav_param.lower() == 'backward'
+            ):
+                return -1
             return self._EASYR1_JSON_NAV_MAP.get((nav_type.lower(), nav_param.lower()), -1)
 
         return None
@@ -821,15 +868,21 @@ class VLMPlanner():
         action_token = token_match.group(1).strip()
         action_key = action_token.lower()
         if action_key in nav_map:
+            if not self.easyr1_navigation_only and action_key in ('moveback_25', 'moveback'):
+                return -1
             return nav_map[action_key]
 
         if action_key in inter_map:
             point_match = re.search(r'[\[\(]\s*(-?\d+)\s*[,，]\s*(-?\d+)\s*[\]\)]', answer_text)
             if point_match is None:
                 return -1
-            x = int(point_match.group(1))
-            y = int(point_match.group(2))
-            return {"action": inter_map[action_key], "point": [x, y]}
+            point = self._normalize_easyr1_point(
+                [point_match.group(1), point_match.group(2)],
+                scale=True,
+            )
+            if point is None:
+                return -1
+            return {"action": inter_map[action_key], "point": point}
 
         return None
     

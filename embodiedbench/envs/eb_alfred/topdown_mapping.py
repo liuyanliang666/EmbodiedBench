@@ -54,6 +54,9 @@ class AlfredTopdownConfig:
     occupancy_dilation: int = 1
     square_bounds: bool = False
     fixed_world_extent: float = 10.0
+    # Meters added to THOR agent.position.y to recover the camera's world height.
+    # Mirrors EasyR1's --topdown-camera-y-offset (0.675 for physically correct ALFRED).
+    camera_y_offset: float = 0.0
 
 
 class AlfredTopdownBuilder:
@@ -135,7 +138,7 @@ class AlfredTopdownBuilder:
                 y=-float(position["x"]),
                 yaw=-math.radians(float(rotation["y"])),
                 pitch=-math.radians(float(agent.get("cameraHorizon", 0.0))),
-                camera_height=float(position["y"]),
+                camera_height=float(position["y"]) + self.config.camera_y_offset,
             )
         except (KeyError, TypeError, ValueError):
             return None

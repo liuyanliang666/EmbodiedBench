@@ -289,7 +289,7 @@ class AlfredTopdownPlannerTests(unittest.TestCase):
 class AlfredSummaryRecursionTests(unittest.TestCase):
     """Cover the EasyR1 v4-summary fields injected into alfred.jinja."""
 
-    def _make_planner(self, use_topdown_prompt=False):
+    def _make_planner(self, use_topdown_prompt=False, kwargs=None):
         return VLMPlanner(
             "dummy-model",
             "custom",
@@ -298,6 +298,7 @@ class AlfredSummaryRecursionTests(unittest.TestCase):
             examples=[],
             use_easyr1_format=True,
             use_topdown_prompt=use_topdown_prompt,
+            kwargs=kwargs or {},
         )
 
     def test_held_object_extracted_from_recent_feedback(self):
@@ -363,6 +364,44 @@ class AlfredSummaryRecursionTests(unittest.TestCase):
         self.assertIn("I have located the apple.", prompt)
         self.assertIn("The apple sits on the counter at front-right.", prompt)
         self.assertNotIn("(none, first step)", prompt)
+
+    def test_backward_outputs_are_invalid_in_easyr1_alfred_mode(self):
+        planner = self._make_planner()
+
+        backward_outputs = [
+            '<answer> [{"action_type": "Move", "parameter": "backward"}] </answer>',
+            '<answer> MoveBack </answer>',
+            '<answer> Move backward by 0.25 </answer>',
+        ]
+
+        for output in backward_outputs:
+            with self.subTest(output=output):
+                self.assertEqual(planner.json_to_action(output), -1)
+
+    def test_qwen3_prompt_template_scales_normalized_points_to_image_coordinates(self):
+        planner = self._make_planner(
+            kwargs={"prompt_template_path": "/tmp/alfred_summary_v4_concise_qwen3.jinja"}
+        )
+
+        action = planner.json_to_action(
+            '<answer> [{"action_type": "PickupObject", "parameter": [508, 492]}] </answer>'
+        )
+
+        self.assertEqual(action, {"action": "pickup_by_point", "point": [305, 295]})
+
+    def test_qwen3_point_output_resolution_can_target_interaction_frame(self):
+        planner = self._make_planner(
+            kwargs={
+                "prompt_template_path": "/tmp/alfred_summary_v4_concise_qwen3.jinja",
+                "point_output_resolution": 300,
+            }
+        )
+
+        action = planner.json_to_action(
+            '<answer> [{"action_type": "PickupObject", "parameter": [508, 492]}] </answer>'
+        )
+
+        self.assertEqual(action, {"action": "pickup_by_point", "point": [152, 148]})
 
     def test_first_step_defaults_when_no_prior_state(self):
         planner = self._make_planner()

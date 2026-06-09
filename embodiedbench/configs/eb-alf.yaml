@@ -13,3 +13,12 @@ exp_name: baseline
 env_feedback: True
 tp: 1
 easyr1_format: null
+prompt_template_path: null
+point_input_resolution: null
+point_output_resolution: null
+max_episode_steps: 30
+max_invalid_actions: 10
+# Topdown reconstruction params (aligned with EasyR1's CLI defaults).
+topdown_camera_y_offset: 0.675
+topdown_min_height: 0.1
+topdown_max_height: 2.0
